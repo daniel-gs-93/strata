@@ -1,8 +1,8 @@
 # Strata
 
-Strata is a small database that can be run from a terminal. It reads Structured Query Language (SQL) statements through a Command-Line Interface (CLI), parses them and turns each one into a plan, and hands the plan to a storage engine. The parser and the binder, which resolves names and builds the plan, are shared by every engine, so an engine only has to execute plans and decide how data is stored. The first engine, flatfile, is deliberately plain: it is the baseline that the second engine, paged, is compared with. The paged engine keeps a database in one file of fixed-size pages and reads them through a buffer pool.
+Strata is a small database that can be run from a terminal. It reads Structured Query Language (SQL) statements through a Command-Line Interface (CLI), parses them and turns each one into a plan, and hands the plan to a storage engine. The parser and the binder, which resolves names and builds the plan, are shared by every engine, so an engine only has to execute plans and decide how data is stored. The first engine, flatfile, is deliberately plain: it is the baseline that the second engine, paged, is compared with. The paged engine keeps a database in one file of fixed-size pages and reads them through a buffer pool, a cache that keeps some of the pages in memory.
 
-In the flatfile engine a directory is a database. `catalog.csv` records the table definitions, and each table is a Comma-Separated Values (CSV) file. Writes go back to the CSV immediately, and a write that spans several files either completes or changes nothing.
+In the flatfile engine a directory is a database. `catalog.csv` records the table definitions, and each table is a Comma-Separated Values (CSV) file. Writes go back to the CSV immediately, and a write that spans several files either completes or changes nothing, except when a rename fails and so does the undo of the earlier ones; the error then names the `.orig` file that holds the original content.
 
 ## Documentation
 
@@ -17,8 +17,8 @@ In the flatfile engine a directory is a database. `catalog.csv` records the tabl
 ```text
 strata/
 ├── include/strata/
-│   ├── domain/            # values, syntax tree, plan, Binder, expression evaluation, scalar functions, import inference, engine port
-│   ├── paged/             # the paged engine: page format, buffer pool, page allocator, table heap, catalog, operators, writes
+│   ├── domain/            # values, syntax tree, plan, Binder, expression evaluation, scalar functions, import inference, engine port, index inspector port
+│   ├── paged/             # the paged engine: page format, buffer pool, page allocator, table heap, B+Tree index, catalog, operators, writes
 │   ├── application.h      # QueryService: run one statement, import a CSV
 │   ├── bootstrap.h        # acquire the directory lock, assemble the engine and QueryService, shared by every entry point
 │   ├── sql_parser.h       # SQL parser
@@ -47,7 +47,7 @@ This produces `build/strata_cli` and `build/strata_tests`.
 
 ## Quick Start
 
-The CLI reads commands and SQL statements from standard input, line by line, until the input ends. `strata_cli [<directory> [--parallel]]` opens a database at startup, like typing `.open <directory> [--parallel]` afterwards. Any other arguments print the usage to standard error and exit with status 2.
+The CLI reads commands and SQL statements from standard input, line by line, until the input ends. `strata_cli [<directory> [--parallel]]` opens a database at startup, like typing `.open <directory> [--parallel]` afterwards. Any other arguments, a first argument that starts with `-` included, print the usage to standard error and exit with status 2; write a directory whose name starts with `-` as `./-name`.
 
 A statement ends with `;` and can span several lines. One line can hold several statements, a `;` inside a string literal does not end one, and `--` starts a comment that runs to the end of the line. `.open <directory>` has to come before the first SQL statement. If the directory does not exist but its parent does, `.open` creates it and prints `created new database <directory>`.
 
@@ -60,6 +60,7 @@ On a terminal the prompt is `strata> `, which changes to `   ...> ` inside an un
 | `.import <file.csv> [<table>] [--pk <column>] [--type <column>=<type>]... [--skip-bad-rows]` | Imports a CSV into a new table |
 | `.tables` | Lists one table per line |
 | `.schema [<table>]` | Prints `CREATE TABLE` statements that can be run again |
+| `.dump index <table>` | Prints the shape of the index of a `paged` table and the result of its check (see Engines) |
 | `.clear` | Clears the screen; prints nothing unless standard input is a terminal |
 | `.cancel` | Abandons an unfinished statement; inside a string literal the line is read as part of the string |
 | `.help` | Prints the command list |
@@ -187,7 +188,7 @@ id	body	owner	pinned
 
 `/tmp/mydb` now holds `catalog.csv` and `notes.csv`, and `.open /tmp/mydb` loads the table again. `--parallel` loads the tables with several threads and gives the same result.
 
-`.open` fails with `error: could not open <directory>: <reason>`, where `<reason>` includes `no such directory` when the parent does not exist, `not a directory` when the path is a file, and `cannot create directory` when creation fails. The open database stays as it was. With the paged engine, a `paged.db` whose first creation was interrupted fails with a reason that begins `corrupt: paged.db:`, for example `size of 2 pages is below the minimum of 3`. That file holds no data, so delete it and `.open` the directory again.
+`.open` fails with `error: could not open <directory>: <reason>`, where `<reason>` includes `no such directory` when the parent does not exist, `not a directory` when the path is a file, and `cannot create directory` when creation fails. The open database stays as it was. With the paged engine, a `paged.db` whose first creation was interrupted fails with a `corrupt:` reason that names `paged.db`, for example `size of 2 pages is below the minimum of 3`, or `size 100 is not a multiple of 4096` after a partial page. That file holds no data, so delete it and `.open` the directory again.
 
 A statement that spans lines, a `--` comment and `.schema`:
 
@@ -462,7 +463,21 @@ COUNT(*)
 2
 ```
 
-`ALTER TABLE ... ADD COLUMN` copies the rows into a new set of pages and switches to it, and `DROP TABLE` puts the pages of the table on a free list that later tables reuse. The file does not get smaller.
+A table whose primary key is `INT` also has a B+Tree index on that key: a sorted tree of pages in which a key is found by reading one page per level. A `WHERE` that compares the key with an integer literal (`=`, `<`, `<=`, `>` or `>=`, alone or inside `AND`) reads only the rows in that range instead of the whole table, and an `INSERT` that supplies the key into a table without a `UNIQUE` column checks for a duplicate through the index. A row that the `WHERE` does not reach is not read, so an error that the `WHERE` would raise on that row is not raised; Section 2.8 of the design document lists this difference. `.dump index <table>` prints the height (the number of levels), the node count (a node is one page of the tree), the key count, the first 40 nodes level by level from the root and the result of the index check, and answers `error: bind: table <table> has no index` for a table with a `TEXT` key. For the table above:
+
+```bash
+printf '%s\n' '.engine paged' '.open demo' '.dump index students' | "$CLI"
+```
+
+```text
+engine paged
+loaded students=2
+index students(id): height 1, nodes 1, keys 2
+level 0 page 4 keys 2 [1 .. 2]
+check: ok
+```
+
+`ALTER TABLE ... ADD COLUMN` copies the rows into a new set of pages and switches to it, and `DROP TABLE` puts the pages of the table on a list of free pages that later tables reuse. The file does not get smaller.
 
 ```bash
 printf '%s\n' '.engine paged' '.open demo' \
@@ -487,13 +502,14 @@ Both engines:
 
 - There is no NULL. `NOT NULL` is accepted but has no effect, and the length in `VARCHAR(n)` is not checked.
 - Constraints are column-level: a primary key or foreign key covers one column, and there are no table-level constraints and no `DROP COLUMN`.
-- There are no indexes, so a point lookup and a constraint check scan the table. There is no query optimizer, and joins run in `FROM` order.
+- There is no query optimizer, and joins run in `FROM` order.
 - Auto-increment takes the current maximum plus 1, so deleting the row with the maximum frees that value for reuse.
 - Only one process can open a database directory at a time (`.strata.lock`, `flock`).
-- `fsync` is not called after a statement, so a write reported as done can still be lost in a power failure, and a crash in the middle of a write is not recovered.
+- `fsync`, the call that forces written data onto the disk, is not made after a statement, so a write reported as done can still be lost in a power failure, and a crash in the middle of a write is not recovered.
 
 Only `flatfile`:
 
+- There are no indexes, so a point lookup and a constraint check scan the table.
 - Every row of every table is held in memory.
 - A TEXT value or a TEXT `DEFAULT` cannot contain a newline. Commas and double quotes are stored with CSV quoting.
 - A row that cannot be parsed at load (wrong column count, malformed number, unpaired quotes) is not loaded, and the next `UPDATE`, `DELETE` or `ALTER TABLE` rewrite of the table drops it from the file. `INSERT` only appends a row and leaves those lines in place.
@@ -505,11 +521,15 @@ Only `paged`:
 - A row that takes more than 4060 bytes in a page is refused with `error: unsupported: paged engine cannot store a row longer than 4060 bytes in <table>`, because there are no overflow pages.
 - A table name that starts with `sys_` is refused with `error: unsupported: table name '<name>' starts with the reserved prefix sys_`.
 - The file does not shrink. The pages of a dropped table go on a free list and later tables reuse them.
-- A crash in the middle of a statement that writes several pages can leave some of them written. The page checksums and the checks at open detect the damage and report `corrupt`, and nothing repairs it.
+- A crash in the middle of a statement that writes several pages can leave some of them written. A torn page fails its checksum, and a bad header, catalog or free list is refused at open, both as `corrupt`. Pages that are each intact but come from different moments are not caught that way: the index can lack the key of a row, so a lookup by that key finds nothing and an `INSERT` of that key succeeds. Only `.dump index <table>` reports the disagreement, and nothing repairs it.
+- A damaged index root fails `.open` for the whole database, tables that are intact included. A damaged node below the root leaves scans working and fails the lookups that reach it and the `DROP TABLE` of its table. There is no repair command and no export command: the way out is a copy of the data, such as the source CSV files imported again into a new directory.
 - An `.import` that stops midway on an I/O error leaves an empty table behind, and the message ends with `; table <name> was created`. A bad row is rejected before the table is created, and `flatfile` changes nothing in either case.
-- A sort, a hash join or an aggregation is not bounded by the buffer pool, so nothing is promised for data larger than memory.
+- A sort, a hash join (a join that holds one side in an in-memory table) or an aggregation is not bounded by the buffer pool, so nothing is promised for data larger than memory.
+- Only a primary key of type `INT` has an index. A `TEXT` key and a `UNIQUE` column are checked by scanning, and so is a foreign key column when a row that it references is deleted or changed (the check of an `INSERT` into the child table reads the parent through its index when the parent key is an `INT`). An `INSERT` that takes the next auto-increment value scans the table once per statement, so a loop of single-row inserts into such a table takes time that grows with the square of the row count (ten times the rows, a hundred times the time) (one multi-row `INSERT` scans once). A `WHERE` with no top-level `AND` term that compares the key with an integer literal scans the whole table, as in `id + 0 = 5`, `id <> 5`, `id = 1 OR id = 2` and `id = 2.5`. Nothing chooses between an index range and a scan, so a range that covers most of the table reads more pages than a scan would.
+- A delete leaves the index nodes in place, so an index does not shrink, and rows are read from the index in key order, which can differ from the order of a scan when a statement has no `ORDER BY`.
+- A `paged` file written before the index existed (format version 1) is refused with an error; import the data again into a new directory.
 
-Indexes, a Write-Ahead Log (WAL) and crash recovery are planned for `paged`.
+A Write-Ahead Log (WAL) and crash recovery are planned for `paged`.
 
 ## Tests
 
@@ -529,7 +549,7 @@ python3 -I tests/differential/differential.py --cli build/strata_cli
 STRATA_CLI_PATH="$PWD/build/strata_cli" python3 -I -m unittest discover -s tests/differential -p 'test_*.py'
 ```
 
-The unit tests of the comparison run without the variable `STRATA_CLI_PATH`, and the two tests that run the whole corpus are skipped unless it names `strata_cli`.
+The unit tests of the comparison run without the variable `STRATA_CLI_PATH`, and the three tests that run the whole corpus are skipped unless it names `strata_cli`.
 
 ## Acknowledgement
 
