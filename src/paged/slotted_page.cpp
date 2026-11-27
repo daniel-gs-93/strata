@@ -259,10 +259,23 @@ Status SlottedPage::VerifyHeader(const std::uint8_t* page,
         prefix + "header page_id is " + std::to_string(header_page_id));
   }
   const std::uint8_t page_type = page[layout::kPageTypeField];
-  if (page_type > static_cast<std::uint8_t>(PageType::kFree)) {
-    return MakeError(PageErrorCode::kCorrupt, prefix + "page_type " +
-                                                  std::to_string(page_type) +
-                                                  " is not 0, 1, 2 or 3");
+  if (page_type > static_cast<std::uint8_t>(PageType::kIndexNode)) {
+    return MakeError(
+        PageErrorCode::kCorrupt,
+        prefix + "page_type " + std::to_string(page_type) + " is not 0 to 4");
+  }
+  if (page_type == static_cast<std::uint8_t>(PageType::kIndexNode)) {
+    // An index node has no slots and no tuple area: the three heap fields stay
+    // zero (design document 2.10).
+    if (SlotCountOf(page) != 0 || FreeEndOf(page) != 0 ||
+        DeadBytesOf(page) != 0) {
+      return MakeError(
+          PageErrorCode::kCorrupt,
+          prefix + "an index node has slot_count " +
+              std::to_string(SlotCountOf(page)) + ", free_end " +
+              std::to_string(FreeEndOf(page)) + " and dead_bytes " +
+              std::to_string(DeadBytesOf(page)) + " instead of 0, 0 and 0");
+    }
   }
   if (page_type == static_cast<std::uint8_t>(PageType::kHeapData) ||
       page_type == static_cast<std::uint8_t>(PageType::kFree)) {

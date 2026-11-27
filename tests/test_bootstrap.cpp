@@ -190,7 +190,11 @@ TEST(test_bootstrap_open_reports_rejected_lines) {
 
   auto* opened = std::get_if<bootstrap::OpenedDatabase>(&outcome);
   CHECK(opened != nullptr);
-  if (opened == nullptr || opened->tables.size() != 3) {
+  if (opened == nullptr) {
+    return;
+  }
+  CHECK_EQ(opened->tables.size(), std::size_t{3});
+  if (opened->tables.size() != 3) {
     return;
   }
   CHECK_EQ(opened->tables[0].name, std::string("visitors"));

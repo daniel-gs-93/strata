@@ -548,4 +548,75 @@ TEST(test_environment_timing_of_both_engines) {
               TimeWorkload(engines.paged.service.get(), unordered_sql));
 }
 
+namespace {
+
+// FetchPage calls of the pool since its last ResetStats.
+std::uint64_t FetchPageCalls(paged::BufferManager& buffer) {
+  const paged::BufferStats stats = buffer.Stats();
+  return stats.hits + stats.misses;
+}
+
+}  // namespace
+
+// 50 point queries on parcels through the index and 50 that cannot use it, in
+// a pool larger than the table, so that the difference is in the FetchPage
+// calls and not in evictions. The medians are printed for the record only.
+TEST(test_environment_point_lookup_with_and_without_an_index) {
+  TempDir work;
+  WriteScaleCsv(work.path() / "source");
+  std::error_code error;
+  std::filesystem::create_directories(work.path() / "paged", error);
+  PagedFixture paged = MakeFilePagedFixture(work.path() / "paged", 1024,
+                                            ReplacementPolicyKind::kLru);
+  if (paged.service == nullptr) {
+    return;
+  }
+  const std::vector<domain::ImportRequest> requests =
+      DataImports(work.path() / "source");
+  CHECK(AsCommandComplete(paged.service->ImportCsv(requests[1])) != nullptr);
+  paged::Database& database = paged.engine->database();
+  paged::PageResult<paged::TableHeap*> heap = database.Table("parcels");
+  CHECK(heap.ok());
+  if (!heap.ok()) {
+    return;
+  }
+  const std::size_t page_count = heap.value()->FreeSpaceSnapshot().size();
+  CHECK(page_count > 20);
+  // parcels has an index only when the import took its id as the key.
+  CHECK(!database.CheckIndex("parcels").has_value());
+
+  std::vector<double> indexed_times;
+  std::vector<double> scan_times;
+  for (std::size_t i = 0; i < 50; ++i) {
+    const std::string id = std::to_string(1 + i * 199);
+    database.buffer().ResetStats();
+    Clock::time_point start = Clock::now();
+    const ExecutionResult indexed =
+        ExecuteSql(*paged.service,
+                   "SELECT id, label, weight_g FROM parcels WHERE id = " + id);
+    indexed_times.push_back(MillisecondsSince(start));
+    CHECK_EQ(FetchPageCalls(database.buffer()), std::uint64_t{3});
+
+    database.buffer().ResetStats();
+    start = Clock::now();
+    const ExecutionResult scanned = ExecuteSql(
+        *paged.service,
+        "SELECT id, label, weight_g FROM parcels WHERE id + 0 = " + id);
+    scan_times.push_back(MillisecondsSince(start));
+    CHECK(FetchPageCalls(database.buffer()) >= page_count);
+
+    const domain::ResultSet* indexed_rows = AsResultSet(indexed);
+    const domain::ResultSet* scanned_rows = AsResultSet(scanned);
+    CHECK(indexed_rows != nullptr && scanned_rows != nullptr);
+    if (indexed_rows != nullptr && scanned_rows != nullptr) {
+      CHECK_EQ(indexed_rows->rows.size(), std::size_t{1});
+      CHECK(indexed_rows->rows == scanned_rows->rows);
+    }
+  }
+  CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+  std::cout << "[timing] point query on parcels (" << page_count
+            << " pages): indexed median " << Median(indexed_times)
+            << " ms, scan median " << Median(scan_times) << " ms\n";
+}
+
 }  // namespace strata::testing

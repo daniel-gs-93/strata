@@ -16,15 +16,13 @@
 #include <utility>
 #include <vector>
 
+#include "strata/paged/btree.h"
 #include "strata/paged/byte_codec.h"
 #include "strata/paged/tuple_codec.h"
 
 namespace strata::paged {
 
 namespace {
-
-constexpr std::uint32_t kSysTablesId = 1;
-constexpr std::uint32_t kSysColumnsId = 2;
 
 // default_kind values of sys_columns.
 constexpr std::int64_t kDefaultNone = 0;
@@ -163,14 +161,24 @@ struct RawTable {
   std::int64_t first_page;
   std::int64_t primary_key_index;
   std::int64_t auto_increment_index;
+  std::int64_t index_root;
   std::vector<RawColumn> columns;
 };
 
 Row TablesRow(std::uint32_t table_id, const std::string& name,
               PageId first_page, std::int64_t primary_key_index,
-              std::int64_t auto_increment_index) {
-  return Row{IntValue(table_id), Value(name), IntValue(first_page),
-             IntValue(primary_key_index), IntValue(auto_increment_index)};
+              std::int64_t auto_increment_index, PageId index_root) {
+  return Row{IntValue(table_id),
+             Value(name),
+             IntValue(first_page),
+             IntValue(primary_key_index),
+             IntValue(auto_increment_index),
+             IntValue(index_root)};
+}
+
+// A table has an index exactly when its primary key is an INT (ADR-0048).
+bool HasIndex(const TableSchema& schema) {
+  return schema.columns[schema.primary_key_index].type == DataType::kInt;
 }
 
 Row ColumnsRow(std::uint32_t table_id, std::size_t position,
@@ -290,7 +298,7 @@ Status CheckColumnRowFits(const TableSchema& schema, std::size_t position) {
 // table's first page.
 Status CheckCatalogRowsFit(const TableSchema& schema) {
   PageResult<std::vector<std::uint8_t>> table_row = TupleCodec::Encode(
-      Catalog::SysTablesSchema(), TablesRow(0, schema.name, 0, 0, -1));
+      Catalog::SysTablesSchema(), TablesRow(0, schema.name, 0, 0, -1, 0));
   if (!table_row.ok()) {
     return Invalid(
         "table " + schema.name +
@@ -332,7 +340,8 @@ TableSchema Catalog::SysTablesSchema() {
                     {"name", DataType::kText},
                     {"first_page", DataType::kInt},
                     {"primary_key_index", DataType::kInt},
-                    {"auto_increment_index", DataType::kInt}};
+                    {"auto_increment_index", DataType::kInt},
+                    {"index_root", DataType::kInt}};
   schema.primary_key_index = 0;
   return schema;
 }
@@ -400,7 +409,8 @@ Status Catalog::Load() {
     const Row& row = next.value()->row;
     RawTable table;
     const std::int64_t raw_id = IntAt(row, 0);
-    if (raw_id < 3 || raw_id > std::numeric_limits<std::uint32_t>::max()) {
+    if (raw_id < kFirstUserTableId ||
+        raw_id > std::numeric_limits<std::uint32_t>::max()) {
       return Corrupt("sys_tables has the invalid table_id " +
                      std::to_string(raw_id));
     }
@@ -409,6 +419,7 @@ Status Catalog::Load() {
     table.first_page = IntAt(row, 2);
     table.primary_key_index = IntAt(row, 3);
     table.auto_increment_index = IntAt(row, 4);
+    table.index_root = IntAt(row, 5);
     if (tables.contains(table.table_id)) {
       return Corrupt("table_id " + std::to_string(table.table_id) +
                      " appears twice in sys_tables");
@@ -524,9 +535,28 @@ Status Catalog::Load() {
       schema.auto_increment_index =
           static_cast<std::size_t>(table.auto_increment_index);
     }
+    // A table has a root exactly when its primary key is an INT, and a root is
+    // a page of the file above the system pages (ADR-0048).
+    if (!HasIndex(schema) && table.index_root != 0) {
+      return Corrupt("table " + table.name + ": index_root " +
+                     std::to_string(table.index_root) +
+                     " is set but the primary key is not an INT");
+    }
+    if (HasIndex(schema) && table.index_root == 0) {
+      return Corrupt("table " + table.name +
+                     ": index_root is 0 but the primary key is an INT");
+    }
+    if (table.index_root != 0 &&
+        (table.index_root < kFirstUserPage || table.index_root >= page_count)) {
+      return Corrupt("table " + table.name + ": index_root " +
+                     std::to_string(table.index_root) + " is below page " +
+                     std::to_string(kFirstUserPage) + " or outside the file (" +
+                     std::to_string(page_count) + " pages)");
+    }
     position_of_name[domain::ToLower(table.name)] = entries.size();
     entries.push_back(Entry{table_id, std::move(schema),
-                            static_cast<PageId>(table.first_page)});
+                            static_cast<PageId>(table.first_page),
+                            static_cast<PageId>(table.index_root)});
   }
   // A foreign key target is checked once every table is known. The lookup by
   // lowercase name is O(1) on average.
@@ -545,7 +575,8 @@ Status Catalog::Load() {
       }
     }
   }
-  if (header_next_table_id <= highest_table_id || header_next_table_id < 3) {
+  if (header_next_table_id <= highest_table_id ||
+      header_next_table_id < kFirstUserTableId) {
     return Corrupt("the file header's next_table_id " +
                    std::to_string(header_next_table_id) +
                    " is not above the highest table_id " +
@@ -598,6 +629,16 @@ std::optional<PageId> Catalog::FirstPage(const std::string& name) const {
   return entries_[found->second].first_page;
 }
 
+std::optional<PageId> Catalog::IndexRoot(const std::string& name) const {
+  std::shared_lock<std::shared_mutex> cache_lock(cache_mutex_);
+  auto found = position_of_name_.find(domain::ToLower(name));
+  if (found == position_of_name_.end() ||
+      entries_[found->second].index_root == 0) {
+    return std::nullopt;
+  }
+  return entries_[found->second].index_root;
+}
+
 std::string Catalog::UndoRows(const std::vector<Rid>& table_rows,
                               const std::vector<Rid>& column_rows) {
   std::string failure;
@@ -640,6 +681,16 @@ PageResult<TableSchema> Catalog::CreateTable(const TableSchema& schema) {
   if (!first_page.ok()) {
     return first_page.error();
   }
+  // The root of the index, after the first page of the heap, so that a new
+  // database gives its first table the pages 3 and 4.
+  PageId index_root = 0;
+  if (HasIndex(schema)) {
+    PageResult<BTree> tree = BTree::Create(buffer_, allocator_, table_id);
+    if (!tree.ok()) {
+      return tree.error();
+    }
+    index_root = tree.value().root();
+  }
 
   std::vector<Rid> table_rows;
   std::vector<Rid> column_rows;
@@ -650,9 +701,10 @@ PageResult<TableSchema> Catalog::CreateTable(const TableSchema& schema) {
       schema.auto_increment_index.has_value()
           ? static_cast<std::int64_t>(*schema.auto_increment_index)
           : -1;
-  PageResult<Rid> table_row = sys_tables_->Insert(TablesRow(
-      table_id, schema.name, first_page.value(),
-      static_cast<std::int64_t>(schema.primary_key_index), auto_increment));
+  PageResult<Rid> table_row = sys_tables_->Insert(
+      TablesRow(table_id, schema.name, first_page.value(),
+                static_cast<std::int64_t>(schema.primary_key_index),
+                auto_increment, index_root));
   if (table_row.ok()) {
     table_rows.push_back(table_row.value());
   } else {
@@ -687,7 +739,7 @@ PageResult<TableSchema> Catalog::CreateTable(const TableSchema& schema) {
   }
   std::unique_lock<std::shared_mutex> cache_lock(cache_mutex_);
   position_of_name_[domain::ToLower(schema.name)] = entries_.size();
-  entries_.push_back(Entry{table_id, schema, first_page.value()});
+  entries_.push_back(Entry{table_id, schema, first_page.value(), index_root});
   next_table_id_ = table_id + 1;
   return schema;
 }
@@ -740,7 +792,7 @@ PageResult<Rid> Catalog::FindTablesRow(std::uint32_t table_id) const {
 
 Status Catalog::CommitAddColumn(const std::string& table,
                                 const domain::ColumnDef& column,
-                                PageId new_first_page) {
+                                PageId new_first_page, PageId new_index_root) {
   std::lock_guard<std::mutex> ddl_lock(ddl_mutex_);
   if (sys_tables_ == nullptr) {
     return MakeError(PageErrorCode::kInvalidArgument,
@@ -772,7 +824,7 @@ Status Catalog::CommitAddColumn(const std::string& table,
       tables_rid.value(),
       TablesRow(entry.table_id, entry.schema.name, new_first_page,
                 static_cast<std::int64_t>(entry.schema.primary_key_index),
-                auto_increment));
+                auto_increment, new_index_root));
   if (updated.has_value()) {
     PageError failure = *updated;
     if (Status undone = sys_columns_->Delete(column_rid.value())) {
@@ -783,6 +835,7 @@ Status Catalog::CommitAddColumn(const std::string& table,
   std::unique_lock<std::shared_mutex> cache_lock(cache_mutex_);
   entries_[entry_index].schema = std::move(extended).value();
   entries_[entry_index].first_page = new_first_page;
+  entries_[entry_index].index_root = new_index_root;
   return std::nullopt;
 }
 

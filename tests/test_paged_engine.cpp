@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <variant>
@@ -16,6 +17,7 @@
 #include "strata/application.h"
 #include "strata/domain/binder.h"
 #include "strata/domain/import.h"
+#include "strata/paged/btree_node.h"
 #include "strata/paged/byte_codec.h"
 #include "strata/paged/database.h"
 #include "strata/paged/heap_access.h"
@@ -909,6 +911,14 @@ struct FailureCounts {
   int write_back_failures = 0;
 };
 
+// CheckIndex on every table of the engine: the tree is valid and agrees with
+// its heap.
+void CheckEveryIndex(PagedEngine& engine) {
+  for (const std::string& table : engine.Catalog().TableNames()) {
+    CHECK_OK(engine.database().CheckIndex(table));
+  }
+}
+
 // Fails the n-th WritePage of sql for n = 1, 2, ... until the statement no
 // longer fails, and checks the state after each run.
 void CheckEveryWritePosition(const MemoryPageStore& loaded,
@@ -930,6 +940,7 @@ void CheckEveryWritePosition(const MemoryPageStore& loaded,
     }
     PagedEngine& engine = *run.fixture.engine;
     ExpectNoPins(engine);
+    CheckEveryIndex(engine);
     if (CallsOf(run, Operation::kWrite) < nth_write) {
       // The statement made fewer writes: nothing failed, and it succeeded.
       CHECK(AsAffectedRows(run.result) != nullptr);
@@ -1795,11 +1806,13 @@ TEST(test_paged_engine_import_table) {
         std::vector<std::string>{"1000\t1000.5"});
     ExpectNoPins(*fixture.engine);
   }
-  // The second page allocation fails: the table stays, empty.
+  // The third page allocation fails, which is the second page of the data
+  // (the first page of the table and the root of its index come before it):
+  // the table stays, empty.
   {
     ServiceFixture fixture = OpenService(kMinimumFrames, ImportLines(1000));
     QueryService& service = *fixture.service;
-    fixture.store->InjectFailure(Operation::kAllocate, 2);
+    fixture.store->InjectFailure(Operation::kAllocate, 3);
     ExecutionResult result = ImportTable(service, "partial");
     fixture.store->ClearInjectedFailures();
     const ExecutionError* error = ExpectError(result, ErrorKind::kIo);
@@ -2295,6 +2308,305 @@ TEST(test_paged_engine_ddl_is_written_out_and_fails_cleanly) {
       }
       CHECK(has_succeeded);
     }
+  }
+}
+
+namespace {
+
+constexpr const char* kIndexedTables[] = {
+    "CREATE TABLE a (id INT PRIMARY KEY, v INT, t TEXT)",
+    "CREATE TABLE b (id INT PRIMARY KEY, a_id INT REFERENCES a(id), t TEXT)",
+    "CREATE TABLE p (id INT PRIMARY KEY, code INT UNIQUE)",
+    "CREATE TABLE q (code INT PRIMARY KEY REFERENCES p(code), t TEXT)"};
+
+// One random statement over the tables of kIndexedTables. `next_id` is the id
+// that the next insert uses. Sets *is_cascade for a statement that renames
+// the codes of p, which rewrites the primary keys of q.
+std::string RandomStatement(std::mt19937& random, std::int64_t* next_id,
+                            bool* is_cascade) {
+  const unsigned choice = random() % 100;
+  const std::int64_t known =
+      1 + static_cast<std::int64_t>(random() % static_cast<unsigned>(*next_id));
+  *is_cascade = false;
+  if (choice < 25) {
+    return "INSERT INTO a VALUES (" + std::to_string((*next_id)++) + ", " +
+           std::to_string(random() % 10) + ", '" +
+           std::string(random() % 600, 'x') + "')";
+  }
+  if (choice < 35) {
+    return "INSERT INTO b VALUES (" + std::to_string((*next_id)++) + ", " +
+           std::to_string(known) + ", 'y')";
+  }
+  if (choice < 45) {
+    // A TEXT that grows moves rows to other pages.
+    return "UPDATE a SET t = '" + std::string(200 + random() % 1500, 'z') +
+           "' WHERE v = " + std::to_string(random() % 10);
+  }
+  if (choice < 53) {
+    return "UPDATE a SET v = v + 1 WHERE id <= " + std::to_string(known);
+  }
+  if (choice < 61) {
+    return "DELETE FROM a WHERE id = " + std::to_string(known);
+  }
+  if (choice < 67) {
+    return "DELETE FROM b WHERE id <= " + std::to_string(known / 2);
+  }
+  if (choice < 75) {
+    const std::int64_t id = (*next_id)++;
+    return "INSERT INTO p VALUES (" + std::to_string(id) + ", " +
+           std::to_string(id) + ")";
+  }
+  if (choice < 83) {
+    return "INSERT INTO q VALUES (" + std::to_string(known) + ", 'q')";
+  }
+  if (choice < 89) {
+    *is_cascade = true;
+    return "UPDATE p SET code = code + 1";
+  }
+  if (choice < 92) {
+    *is_cascade = true;
+    return "UPDATE p SET code = code - 1";
+  }
+  if (choice < 96) {
+    return "DELETE FROM q WHERE code <= " + std::to_string(known);
+  }
+  return "DELETE FROM p WHERE id = " + std::to_string(known);
+}
+
+}  // namespace
+
+TEST(test_paged_engine_keeps_index_and_heap_in_step) {
+  StoreEngine fixture = NewEngine(64);
+  if (fixture.engine == nullptr) {
+    return;
+  }
+  PagedEngine& engine = *fixture.engine;
+  for (const char* sql : kIndexedTables) {
+    CHECK(AsCommandComplete(Run(engine, sql)) != nullptr);
+  }
+  // Thirty parents and thirty children with consecutive codes, so that a
+  // cascade renames A to B and B to C in the keys of q.
+  std::string parents = "INSERT INTO p VALUES ";
+  std::string children = "INSERT INTO q VALUES ";
+  for (int code = 1; code <= 30; ++code) {
+    parents += (code > 1 ? ", (" : "(") + std::to_string(code) + ", " +
+               std::to_string(code) + ")";
+    children += (code > 1 ? ", (" : "(") + std::to_string(code) + ", 'q')";
+  }
+  ExpectAffected(Run(engine, parents), 30);
+  ExpectAffected(Run(engine, children), 30);
+
+  std::mt19937 random(31);
+  std::int64_t next_id = 100;
+  int statements_applied = 0;
+  int cascades_applied = 0;
+  for (int step = 0; step < 2000; ++step) {
+    bool is_cascade = false;
+    const std::string sql = RandomStatement(random, &next_id, &is_cascade);
+    const ExecutionResult result = Run(engine, sql);
+    if (AsAffectedRows(result) != nullptr) {
+      ++statements_applied;
+      if (is_cascade) {
+        ++cascades_applied;
+      }
+    }
+    CheckEveryIndex(engine);
+    if (engine.database().buffer().PinnedFrameCount() != 0) {
+      ExpectNoPins(engine);
+      return;
+    }
+  }
+  CHECK(statements_applied > 800);
+  CHECK(cascades_applied > 10);
+
+  // With 4 frames, a write that fails at each position leaves the heap and the
+  // index in step: a cascade, a 300-row insert that splits leaves, a 150-row
+  // delete.
+  const Dataset dataset{4, 200, 200, 100};
+  StoreEngine loaded = LoadedTemplate(dataset);
+  FailureCounts cascade_counts;
+  CheckEveryWritePosition(*loaded.store, kCascadeUpdate, &cascade_counts);
+  CHECK(cascade_counts.apply_failures > 0);
+  FailureCounts insert_counts;
+  CheckEveryWritePosition(
+      *loaded.store,
+      ReactionInsert(1000, 300, dataset.story_count, dataset.padding),
+      &insert_counts);
+  CHECK(insert_counts.apply_failures > 0);
+  FailureCounts delete_counts;
+  CheckEveryWritePosition(
+      *loaded.store, "DELETE FROM reactions WHERE id <= 150", &delete_counts);
+  CHECK(delete_counts.apply_failures > 0);
+}
+
+namespace {
+
+// A copy of `loaded` in which the leaf entry of `key` is missing from the index
+// of `table`, written with a valid checksum, and an engine over it.
+StoreEngine OpenWithoutIndexEntry(const MemoryPageStore& loaded,
+                                  const std::string& table, std::int64_t key) {
+  StoreEngine reference = OpenCopy(loaded);
+  StoreEngine none;
+  if (reference.engine == nullptr) {
+    return none;
+  }
+  const std::optional<PageId> root =
+      reference.engine->database().catalog().IndexRoot(table);
+  CHECK(root.has_value());
+  if (!root.has_value()) {
+    return none;
+  }
+  std::unique_ptr<MemoryPageStore> copy = CopyOf(loaded);
+  std::uint8_t* const page = copy->MutablePage(*root);
+  CHECK(paged::NodeView(page).is_leaf());  // 50 keys fit in the root
+  const paged::LeafPosition position = paged::LeafSearch(page, key);
+  CHECK(position.is_found);
+  paged::LeafRemoveAt(page, position.index);
+  paged::SlottedPage::SealChecksum(page);
+  return OpenStoreEngine(std::move(copy), 16);
+}
+
+}  // namespace
+
+TEST(test_paged_engine_reports_an_index_entry_that_is_missing) {
+  StoreEngine loaded = NewEngine(64);
+  if (loaded.engine == nullptr) {
+    return;
+  }
+  // 50 rows of about 1000 bytes: three to a page, each page nearly full.
+  ExpectComplete(
+      Run(*loaded.engine,
+          "CREATE TABLE gems (id INT PRIMARY KEY, tag INT, body TEXT)"),
+      "CREATE TABLE gems");
+  std::string insert = "INSERT INTO gems VALUES ";
+  for (int id = 1; id <= 50; ++id) {
+    insert += (id > 1 ? ", (" : "(") + std::to_string(id) + ", " +
+              std::to_string(id) + ", '" + std::string(1000, 'g') + "')";
+  }
+  ExpectAffected(Run(*loaded.engine, insert), 50);
+  CHECK(!loaded.engine->Flush().has_value());
+
+  // The statements read the row through a non-key column, because a key
+  // predicate reads through the index and would skip it.
+  const std::string statements[] = {
+      "DELETE FROM gems WHERE tag = 7",
+      "UPDATE gems SET body = '" + std::string(2500, 'h') + "' WHERE tag = 7"};
+  for (const std::string& sql : statements) {
+    StoreEngine damaged = OpenWithoutIndexEntry(*loaded.store, "gems", 7);
+    if (damaged.engine == nullptr) {
+      return;
+    }
+    PagedEngine& engine = *damaged.engine;
+    const std::vector<std::string> others_before =
+        SortedQueryText(engine, "SELECT id, tag FROM gems WHERE tag <> 7");
+    CHECK_EQ(others_before.size(), std::size_t{49});
+
+    const ExecutionResult result = Run(engine, sql);
+    const ExecutionError* error = ExpectError(result, ErrorKind::kIo);
+    if (error != nullptr) {
+      CHECK_EQ(error->message,
+               std::string("corrupt: index of gems has no entry for key 7"));
+    }
+    // The row is still in the table, and the other 49 rows read as before.
+    CHECK_EQ(QueryText(engine, "SELECT COUNT(*) FROM gems"),
+             std::vector<std::string>{"50"});
+    CHECK_EQ(QueryText(engine, "SELECT id FROM gems WHERE tag = 7"),
+             std::vector<std::string>{"7"});
+    CHECK_EQ(SortedQueryText(engine, "SELECT id, tag FROM gems WHERE tag <> 7"),
+             others_before);
+    // The index is still damaged, and CheckIndex names the key.
+    const paged::Status check = engine.database().CheckIndex("gems");
+    CHECK_ERROR(check, kCorrupt);
+    CHECK_MESSAGE_CONTAINS(check, "has no entry for key 7");
+    ExpectNoPins(engine);
+  }
+}
+
+namespace {
+
+// The outcome of one statement as text: the sorted lines of a result set,
+// "affected=<n>", or the error.
+std::string OutcomeText(PagedEngine& engine, const std::string& sql) {
+  const ExecutionResult result = Run(engine, sql);
+  if (const domain::ResultSet* rows = AsResultSet(result)) {
+    std::string text;
+    for (const std::string& line : SortedTextOf(rows->rows)) {
+      text += line + "\n";
+    }
+    return text;
+  }
+  return DescribeResult(result);
+}
+
+// Loads 1500 rows with ascending keys (the last leaf then holds 195 keys) and
+// runs statements that read and change the index; returns each outcome.
+std::vector<std::string> IndexedStatementOutcomes(StoreEngine& fixture) {
+  PagedEngine& engine = *fixture.engine;
+  std::vector<std::string> outcomes;
+  CHECK(AsCommandComplete(Run(
+            engine,
+            "CREATE TABLE wide (id INT PRIMARY KEY, grp INT, body TEXT)")) !=
+        nullptr);
+  CHECK(AsCommandComplete(Run(
+            engine, "CREATE TABLE narrow (id INT PRIMARY KEY, label TEXT)")) !=
+        nullptr);
+  for (int first = 1; first <= 1500; first += 100) {
+    std::string wide = "INSERT INTO wide VALUES ";
+    std::string narrow = "INSERT INTO narrow VALUES ";
+    for (int id = first; id < first + 100; ++id) {
+      const std::string suffix = id < first + 99 ? ", " : "";
+      wide += "(" + std::to_string(id) + ", " + std::to_string(id % 7) + ", '" +
+              std::string(40, 'w') + "')" + suffix;
+      narrow += "(" + std::to_string(id) + ", 'n" + std::to_string(id) + "')" +
+                suffix;
+    }
+    ExpectAffected(Run(engine, wide), 100);
+    ExpectAffected(Run(engine, narrow), 100);
+  }
+  std::string more = "INSERT INTO wide VALUES ";
+  for (int id = 1501; id <= 1600; ++id) {
+    more += "(" + std::to_string(id) + ", 0, 'm')" + (id < 1600 ? ", " : "");
+  }
+  const std::string statements[] = {
+      "SELECT id, grp FROM wide WHERE id = 1234",
+      "SELECT COUNT(*), MIN(id), MAX(id) FROM wide WHERE id >= 100 AND id < "
+      "400",
+      more,
+      "UPDATE wide SET body = '" + std::string(3000, 'u') + "' WHERE id = 1234",
+      "DELETE FROM wide WHERE id >= 1550 AND id < 1560",
+      "SELECT wide.id, narrow.label FROM wide JOIN narrow ON wide.id = "
+      "narrow.id WHERE wide.id = 700 AND narrow.id = 700",
+      "SELECT COUNT(*) FROM wide"};
+  for (const std::string& sql : statements) {
+    outcomes.push_back(OutcomeText(engine, sql));
+    CHECK(!Contains(outcomes.back(), "buffer pool exhausted"));
+    CHECK(!Contains(outcomes.back(), "error"));
+    ExpectNoPins(engine);
+  }
+  CheckEveryIndex(engine);
+  return outcomes;
+}
+
+}  // namespace
+
+TEST(test_paged_engine_runs_indexed_statements_in_four_frames) {
+  StoreEngine large = NewEngine(256);
+  if (large.engine == nullptr) {
+    return;
+  }
+  const std::vector<std::string> expected = IndexedStatementOutcomes(large);
+  CHECK_EQ(expected.size(), std::size_t{7});
+  CHECK_EQ(expected[0],
+           std::string("1234\t") + std::to_string(1234 % 7) + "\n");
+  const ReplacementPolicyKind policies[] = {ReplacementPolicyKind::kLru,
+                                            ReplacementPolicyKind::kTwoQ};
+  for (ReplacementPolicyKind policy : policies) {
+    StoreEngine small = OpenStoreEngine(std::make_unique<MemoryPageStore>(),
+                                        kMinimumFrames, policy);
+    if (small.engine == nullptr) {
+      return;
+    }
+    CHECK(IndexedStatementOutcomes(small) == expected);
   }
 }
 

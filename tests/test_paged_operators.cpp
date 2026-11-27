@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,6 +12,8 @@
 
 #include "strata/domain/plan.h"
 #include "strata/domain/value.h"
+#include "strata/paged/index_reader.h"
+#include "strata/paged/key_range.h"
 #include "strata/paged/operators.h"
 #include "strata/paged/row_keys.h"
 #include "strata/paged/row_stream.h"
@@ -1112,4 +1115,254 @@ TEST(test_operators_build_rejects_non_query_node) {
     return;
   }
   CHECK_EQ(nested_error->message, "not a query plan node");
+}
+
+namespace {
+
+// ----------------------------------------------------------------------------
+// Key ranges and the choice of the index scan (ADR-0052).
+// ----------------------------------------------------------------------------
+
+// The first FilterNode of a plan, found top down and left before right.
+const domain::FilterNode* FindFilter(const PlanNode& plan) {
+  if (const auto* filter = std::get_if<domain::FilterNode>(&plan.node)) {
+    return filter;
+  }
+  if (const auto* project = std::get_if<domain::ProjectNode>(&plan.node)) {
+    return FindFilter(*project->child);
+  }
+  if (const auto* sort = std::get_if<domain::SortNode>(&plan.node)) {
+    return FindFilter(*sort->child);
+  }
+  if (const auto* limit = std::get_if<domain::LimitNode>(&plan.node)) {
+    return FindFilter(*limit->child);
+  }
+  if (const auto* join = std::get_if<domain::JoinNode>(&plan.node)) {
+    if (const domain::FilterNode* left = FindFilter(*join->left)) {
+      return left;
+    }
+    return FindFilter(*join->right);
+  }
+  return nullptr;
+}
+
+// "none", or the range as an interval such as "[3, 9]" or "(-inf, 5)", with
+// " empty" when no key can lie in it.
+std::string DescribeRange(const std::optional<paged::KeyRange>& range) {
+  if (!range.has_value()) {
+    return "none";
+  }
+  std::string text =
+      range->low.has_value()
+          ? (range->is_low_inclusive ? "[" : "(") + std::to_string(*range->low)
+          : "(-inf";
+  text += ", ";
+  text += range->high.has_value() ? std::to_string(*range->high) +
+                                        (range->is_high_inclusive ? "]" : ")")
+                                  : "+inf)";
+  if (range->IsEmpty()) {
+    text += " empty";
+  }
+  return text;
+}
+
+// A table for the key tests: the key in column 0, a TEXT and another INT.
+void AddKeyTable(TestTables* tables, const std::string& name) {
+  tables->Add(name,
+              {Column("id", DataType::kInt), Column("name", DataType::kText),
+               Column("other", DataType::kInt)},
+              {Row{Int(1), Text("a"), Int(10)}, Row{Int(3), Text("b"), Int(20)},
+               Row{Int(5), Text("c"), Int(30)}, Row{Int(7), Text("d"), Int(40)},
+               Row{Int(9), Text("e"), Int(50)}});
+}
+
+// The terms first to last (last excluded) as a balanced tree of AND with
+// parentheses, so that its depth is about log2 of the number of terms; a flat
+// chain of 1000 terms is deeper than the parser accepts. Term 500 is the key
+// term and the others do not name the key.
+std::string BalancedConjunction(int first, int last) {
+  if (last - first == 1) {
+    return first == 500 ? "id = 77" : "other <> " + std::to_string(first);
+  }
+  const int middle = first + (last - first) / 2;
+  return "(" + BalancedConjunction(first, middle) + " AND " +
+         BalancedConjunction(middle, last) + ")";
+}
+
+// The WHERE clause with 1000 terms of which one is a key term.
+std::string LargeConjunction() { return BalancedConjunction(0, 1000); }
+
+}  // namespace
+
+TEST(test_paged_key_range_extracts_bounds_from_conjuncts) {
+  TestTables tables;
+  AddKeyTable(&tables, "t");
+  struct Case {
+    std::string where;
+    std::string expected;
+  };
+  const std::vector<Case> cases = {{"id = 5", "[5, 5]"},
+                                   {"5 = id", "[5, 5]"},
+                                   {"id < 5", "(-inf, 5)"},
+                                   {"5 < id", "(5, +inf)"},
+                                   {"id <= 5", "(-inf, 5]"},
+                                   {"id > 5", "(5, +inf)"},
+                                   {"id >= 5", "[5, +inf)"},
+                                   {"5 <= id", "[5, +inf)"},
+                                   {"5 > id", "(-inf, 5)"},
+                                   {"5 >= id", "(-inf, 5]"},
+                                   {"id = -5", "[-5, -5]"},
+                                   {"id >= 3 AND id <= 9", "[3, 9]"},
+                                   {"id > 3 AND id > 7", "(7, +inf)"},
+                                   {"id >= 7 AND id >= 3", "[7, +inf)"},
+                                   {"id < 3 AND id < 9", "(-inf, 3)"},
+                                   {"id >= 5 AND id > 5", "(5, +inf)"},
+                                   {"id < 7 AND id <= 7", "(-inf, 7)"},
+                                   {"id = 3 AND id = 4", "[4, 3] empty"},
+                                   {LargeConjunction(), "[77, 77]"},
+                                   {"id = 5 AND name = 'x'", "[5, 5]"},
+                                   {"id <> 5", "none"},
+                                   {"id = 5 OR id = 6", "none"},
+                                   {"id = 2.5", "none"},
+                                   {"id + 0 = 5", "none"},
+                                   {"id = 2 + 3", "none"},
+                                   {"id = other", "none"},
+                                   {"name = 'x'", "none"}};
+  for (const Case& test_case : cases) {
+    PlanPtr plan =
+        MustBind("SELECT * FROM t WHERE " + test_case.where, tables.catalog);
+    if (plan == nullptr) {
+      continue;
+    }
+    const domain::FilterNode* filter = FindFilter(*plan);
+    CHECK(filter != nullptr);
+    if (filter == nullptr) {
+      continue;
+    }
+    const std::string actual =
+        DescribeRange(paged::ExtractKeyRange(*filter->predicate, 0));
+    if (actual != test_case.expected) {
+      // Shows which predicate gave which range.
+      CHECK_EQ(test_case.where.substr(0, 60) + " -> " + actual,
+               test_case.where.substr(0, 60) + " -> " + test_case.expected);
+    }
+  }
+}
+
+namespace {
+
+// An IIndexReader over in-memory tables that records every ScanRange call. It
+// returns all rows of the table whatever the range, so that the filter above it
+// has to drop the rows outside the predicate. Only the key column 0 is indexed.
+class FakeIndexReader : public paged::IIndexReader {
+ public:
+  void AddIndexedTable(const domain::TableSchema& schema, const Rows& rows) {
+    tables_[domain::ToLower(schema.name)] =
+        Table{schema.columns, strata::testing::WithFakeRids(rows)};
+  }
+
+  std::optional<std::size_t> IndexedColumn(
+      const std::string& table) const override {
+    if (tables_.contains(domain::ToLower(table))) {
+      return std::size_t{0};
+    }
+    return std::nullopt;
+  }
+
+  paged::ScanResult ScanRange(const std::string& table,
+                              const paged::KeyRange& range) const override {
+    calls_.push_back(std::make_pair(domain::ToLower(table), range));
+    const Table& found = tables_.at(domain::ToLower(table));
+    return std::unique_ptr<paged::IRowStream>(
+        std::make_unique<strata::testing::VectorRowStream>(found.columns,
+                                                           found.rows));
+  }
+
+  paged::ContainsResult Contains(const std::string&,
+                                 std::int64_t) const override {
+    return false;
+  }
+
+  const std::vector<std::pair<std::string, paged::KeyRange>>& calls() const {
+    return calls_;
+  }
+
+ private:
+  struct Table {
+    std::vector<ColumnDef> columns;
+    std::vector<paged::StoredRow> rows;
+  };
+
+  std::map<std::string, Table> tables_;
+  mutable std::vector<std::pair<std::string, paged::KeyRange>> calls_;
+};
+
+}  // namespace
+
+TEST(test_paged_operators_choose_index_scan_by_plan_shape) {
+  struct Case {
+    const char* sql;
+    std::size_t range_calls;
+    std::size_t scans_of_t;
+    std::size_t scans_of_u;
+    std::size_t rows;
+  };
+  const Case cases[] = {
+      {"SELECT * FROM t WHERE id = 5", 1, 0, 0, 1},
+      {"SELECT * FROM t WHERE name = 'c'", 0, 1, 0, 1},
+      {"SELECT * FROM t", 0, 1, 0, 5},
+      {"SELECT * FROM t JOIN u ON t.id = u.id WHERE t.id + u.id = 10", 0, 1, 1,
+       1},
+      {"SELECT * FROM t JOIN u ON t.id = u.id WHERE t.id = 5", 1, 0, 1, 1},
+      {"SELECT * FROM t WHERE id = 3 AND id = 4", 1, 0, 0, 0},
+      {"SELECT * FROM u WHERE id = 5", 0, 0, 1, 1}};
+  for (const Case& test_case : cases) {
+    TestTables tables;
+    AddKeyTable(&tables, "t");
+    AddKeyTable(&tables, "u");
+    // Only t has an index.
+    FakeIndexReader index_reader;
+    index_reader.AddIndexedTable(
+        *tables.catalog.FindTable("t"),
+        {Row{Int(1), Text("a"), Int(10)}, Row{Int(3), Text("b"), Int(20)},
+         Row{Int(5), Text("c"), Int(30)}, Row{Int(7), Text("d"), Int(40)},
+         Row{Int(9), Text("e"), Int(50)}});
+    PlanPtr plan = MustBind(test_case.sql, tables.catalog);
+    if (plan == nullptr) {
+      continue;
+    }
+    paged::BuildResult built =
+        paged::BuildOperatorTree(*plan, tables.reader, &index_reader);
+    CHECK(std::holds_alternative<std::unique_ptr<paged::IOperator>>(built));
+    if (!std::holds_alternative<std::unique_ptr<paged::IOperator>>(built)) {
+      continue;
+    }
+    // Building the tree reads no row.
+    CHECK_EQ(tables.LogOf("t")->next_calls, std::size_t{0});
+    const Outcome outcome =
+        Drain(*std::get<std::unique_ptr<paged::IOperator>>(built));
+    CHECK(!outcome.error.has_value());
+    CHECK_EQ(outcome.rows.size(), test_case.rows);
+    CHECK_EQ(index_reader.calls().size(), test_case.range_calls);
+    CHECK_EQ(tables.LogOf("t")->scan_calls, test_case.scans_of_t);
+    CHECK_EQ(tables.LogOf("u")->scan_calls, test_case.scans_of_u);
+    if (std::string(test_case.sql).ends_with("id = 3 AND id = 4")) {
+      CHECK(index_reader.calls().size() == 1 &&
+            index_reader.calls()[0].second.IsEmpty());
+    }
+    if (std::string(test_case.sql).ends_with("FROM t WHERE id = 5")) {
+      CHECK_EQ(DescribeRange(index_reader.calls()[0].second),
+               std::string("[5, 5]"));
+    }
+  }
+
+  // A null index reader reads through the table reader only.
+  TestTables tables;
+  AddKeyTable(&tables, "t");
+  PlanPtr plan = MustBind("SELECT * FROM t WHERE id = 5", tables.catalog);
+  if (plan != nullptr) {
+    paged::BuildResult built = paged::BuildOperatorTree(*plan, tables.reader);
+    CHECK(std::holds_alternative<std::unique_ptr<paged::IOperator>>(built));
+    CHECK_EQ(tables.LogOf("t")->scan_calls, std::size_t{1});
+  }
 }

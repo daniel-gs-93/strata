@@ -7,6 +7,8 @@
 
 #include "strata/domain/value.h"
 #include "strata/paged/database.h"
+#include "strata/paged/index_reader.h"
+#include "strata/paged/key_range.h"
 #include "strata/paged/mutation_planner.h"
 #include "strata/paged/paged_types.h"
 #include "strata/paged/row_stream.h"
@@ -77,6 +79,27 @@ class DatabaseTableReader : public ITableReader {
   // <table>" when the catalog has no such table. Several threads may call it
   // at the same time.
   ScanResult Scan(const std::string& table) const override;
+
+ private:
+  Database& database_;
+};
+
+// IIndexReader over a Database (ADR-0051). Borrows the database for its whole
+// life. An index range is read through BTree::Scan, and each row through
+// TableHeap::Get; the stream checks that the row exists and that its primary
+// key is the key of the entry, and reports a mismatch as a kIo error
+// `corrupt: index of <table> names no row <page>:<slot>` or
+// `corrupt: index of <table> disagrees with its row <page>:<slot>`.
+class DatabaseIndexReader : public IIndexReader {
+ public:
+  explicit DatabaseIndexReader(Database& database) : database_(database) {}
+
+  std::optional<std::size_t> IndexedColumn(
+      const std::string& table) const override;
+  ScanResult ScanRange(const std::string& table,
+                       const KeyRange& range) const override;
+  ContainsResult Contains(const std::string& table,
+                          std::int64_t key) const override;
 
  private:
   Database& database_;

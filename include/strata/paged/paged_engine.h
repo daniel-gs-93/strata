@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "strata/domain/engine.h"
+#include "strata/domain/index_inspector.h"
 #include "strata/domain/plan.h"
 #include "strata/domain/value.h"
 #include "strata/paged/database.h"
@@ -49,7 +50,9 @@ struct RowCount {
 using RowCountResult =
     std::variant<std::vector<RowCount>, domain::ExecutionError>;
 
-class PagedEngine : public domain::IEngine {
+// IEngine runs plans; IIndexInspector (design document 2.2, 3.6) describes an
+// index for `.dump index`. QueryService borrows the engine as the inspector.
+class PagedEngine : public domain::IEngine, public domain::IIndexInspector {
  public:
   // Takes ownership of database and shares ownership of directory_lock, which
   // keeps the directory locked for the life of the engine (it may be null in a
@@ -73,6 +76,17 @@ class PagedEngine : public domain::IEngine {
   // "<message>; statement was applied but not saved"; the dirty pages stay in
   // the pool and the next successful write, Flush or Close writes them out.
   domain::ExecutionResult Execute(const domain::PlanNode& plan) override;
+
+  // The shape of the index of the table: height, node and key counts, the
+  // first kMaxDescribedIndexNodes nodes in breadth-first order, and the result
+  // of Database::CheckIndex as text. kBind "unknown table: <table>" or "table
+  // <table> has no index" (a primary key that is not an INT); kIo "corrupt:
+  // ..." when the index cannot be opened or its root cannot be read; a
+  // violation that the check finds is in `check`, not an error. Reads the
+  // pages of the table and its index; needs no writer, so it may run beside
+  // other readers under the shared lock.
+  domain::IndexDescriptionResult DescribeIndex(
+      const std::string& table) override;
 
   // Scans every table in catalog order. Opens each table's heap on the way, so
   // a corrupt page makes the whole call fail. Needs no writer.

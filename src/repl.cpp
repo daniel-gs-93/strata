@@ -14,6 +14,7 @@
 #include "strata/application.h"
 #include "strata/bootstrap.h"
 #include "strata/domain/import.h"
+#include "strata/domain/index_inspector.h"
 #include "strata/domain/value.h"
 #include "strata/sql_parser.h"
 #include "strata/statement_buffer.h"
@@ -33,8 +34,8 @@ constexpr const char* kImportUsage =
     "[--skip-bad-rows]";
 // The command names that are recognised when typed without the leading '.'.
 constexpr const char* kCommandNames[] = {"open",   "engine", "import", "tables",
-                                         "schema", "help",   "quit",   "exit",
-                                         "clear",  "cancel"};
+                                         "schema", "dump",   "help",   "quit",
+                                         "exit",   "clear",  "cancel"};
 constexpr std::size_t kMaxListedLines = 10;
 constexpr const char* kNoDatabase =
     "error: no database open; run .open first\n";
@@ -48,6 +49,7 @@ constexpr const char* kHelp =
     "        [--skip-bad-rows]       import a CSV file as a new table\n"
     ".tables                         list the tables\n"
     ".schema [<table>]               show the CREATE TABLE statements\n"
+    ".dump index <table>             show the shape and the check of an index\n"
     ".clear                          clear the screen\n"
     ".cancel                         discard the statement being typed\n"
     ".help                           show this text\n"
@@ -274,6 +276,56 @@ std::string ShowSchema(const std::string& table, Database& database) {
   return text;
 }
 
+// The text of `.dump index`: the summary line, one line per listed node, a line
+// for the nodes left out and the check (design document 3.6).
+std::string FormatIndexDescription(
+    const domain::IndexDescription& description) {
+  std::string text = "index " + description.table + "(" + description.column +
+                     "): height " + std::to_string(description.height) +
+                     ", nodes " + std::to_string(description.node_count) +
+                     ", keys " + std::to_string(description.key_count) + "\n";
+  for (const domain::IndexNodeDescription& node : description.nodes) {
+    text += "level " + std::to_string(node.level) + " page " +
+            std::to_string(node.page_id) + " keys " +
+            std::to_string(node.key_count);
+    if (node.first_key.has_value() && node.last_key.has_value()) {
+      text += " [" + std::to_string(*node.first_key) + " .. " +
+              std::to_string(*node.last_key) + "]";
+    }
+    if (node.next_page_id.has_value()) {
+      text += " next " + std::to_string(*node.next_page_id);
+    }
+    text += "\n";
+  }
+  if (description.node_count > description.nodes.size()) {
+    text += "... and " +
+            std::to_string(description.node_count - description.nodes.size()) +
+            " more nodes\n";
+  }
+  return text + "check: " + description.check + "\n";
+}
+
+// An unknown table is reported here, as `.schema` does; the other failures are
+// the errors of QueryService::DescribeIndex.
+std::string ShowIndex(const std::string& table, Database& database) {
+  bool is_found = false;
+  for (const domain::TableSchema& schema :
+       database->service->DescribeCatalog()) {
+    if (domain::ToLower(schema.name) == domain::ToLower(table)) {
+      is_found = true;
+    }
+  }
+  if (!is_found) {
+    return "error: no such table: " + table + "\n";
+  }
+  domain::IndexDescriptionResult described =
+      database->service->DescribeIndex(table);
+  if (auto* error = std::get_if<domain::ExecutionError>(&described)) {
+    return RenderResult(domain::ExecutionResult(std::move(*error)));
+  }
+  return FormatIndexDescription(std::get<domain::IndexDescription>(described));
+}
+
 // The result of a line that holds a command.
 struct CommandOutcome {
   bool is_command;  // False: the line is not a command and holds SQL.
@@ -457,6 +509,15 @@ CommandOutcome HandleCommand(const std::string& line, Database& database,
     }
     return Text(
         ShowSchema(tokens.size() == 2 ? tokens[1] : std::string(), database));
+  }
+  if (name == ".dump") {
+    if (tokens.size() != 3 || tokens[1] != "index") {
+      return Text(UsageError(".dump index <table>"));
+    }
+    if (!database) {
+      return Text(kNoDatabase);
+    }
+    return Text(ShowIndex(tokens[2], database));
   }
   if (name == ".help") {
     return Text(tokens.size() == 1 ? std::string(kHelp) : UsageError(".help"));

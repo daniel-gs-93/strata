@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include "strata/domain/value.h"
+#include "strata/paged/btree.h"
 #include "strata/paged/buffer_manager.h"
 #include "strata/paged/catalog.h"
 #include "strata/paged/page_allocator.h"
@@ -64,33 +65,51 @@ class Database {
   // the table fails its checks.
   PageResult<TableHeap*> Table(const std::string& name);
 
+  // The table's index, opened with its heap and cached with it: the same
+  // pointer until Close, destruction, or AddColumn or DropTable of that table.
+  // The pointer is null for a table whose primary key is not an INT. Errors as
+  // Table, and kCorrupt when the root fails the check of BTree::Open.
+  PageResult<BTree*> Index(const std::string& name);
+
+  // The invariants of the tree (BTree::CheckInvariants) and the agreement of
+  // the index with its heap: every row of the heap has an entry with its key
+  // and its Rid, and the entries are as many as the rows. Returns the first
+  // violation as kCorrupt naming the table, or no value. kInvalidArgument: the
+  // table has no index. Errors as Table. Reads every page of the table and of
+  // its index, one at a time.
+  Status CheckIndex(const std::string& name);
+
   // Catalog::CreateTable, refused with kClosed after Close.
   PageResult<domain::TableSchema> CreateTable(
       const domain::TableSchema& schema);
 
   // ALTER TABLE ADD COLUMN (design document 2.6, 3.4, ADR-0045): checks the
   // new catalog row and that every row still fits in a tuple with the
-  // default appended (no page is written when a check fails), copies the rows
-  // into a new page chain, points the catalog at it, and releases the old
-  // chain. Returns the schema after the change. kNotFound: no such table.
-  // kAlreadyExists: the column exists. kInvalidArgument: no DEFAULT of the
-  // column's type, or the catalog row does not fit. kTooLarge: a row would
-  // exceed kMaxTupleSize. kCorrupt: a page of the table fails its checks.
-  // kClosed: after Close. When a step before the switch fails the new chain
-  // is released and the table is as it was; when only the release of the old
-  // chain fails the change is applied and the message ends with `; statement
+  // default appended (no page is written when a check fails, a damaged tree
+  // included: its pages are listed first), copies the rows into a new page
+  // chain and, for a table with an index, inserts each key with its new Rid
+  // into a new tree, points the catalog at both with one row update, and
+  // releases the old chain and the pages of the old tree. Returns the schema
+  // after the change. kNotFound: no such table. kAlreadyExists: the column
+  // exists. kInvalidArgument: no DEFAULT of the column's type, or the catalog
+  // row does not fit. kTooLarge: a row would exceed kMaxTupleSize. kCorrupt: a
+  // page of the table or its index fails its checks. kClosed: after Close.
+  // When a step before the switch fails the new chain and the new tree are
+  // released and the table is as it was; when only the release of the old
+  // pages fails the change is applied and the message ends with `; statement
   // was applied but its pages were not reclaimed`. The caller ensures a
   // single writer and no reader of the table.
   PageResult<domain::TableSchema> AddColumn(const std::string& table,
                                             const domain::ColumnDef& column);
 
-  // DROP TABLE (design document 2.6, 3.4, ADR-0046): removes the table from
-  // the catalog and puts its page chain on the free list. kNotFound,
-  // kCorrupt and kClosed as for AddColumn. When a catalog step fails the rows
-  // already deleted are inserted again; when only the release fails the table
-  // is gone and the message ends with `; statement was applied but its pages
-  // were not reclaimed`. The caller ensures a single writer and no reader of
-  // the table.
+  // DROP TABLE (design document 2.6, 3.4, ADR-0046, ADR-0054): lists the pages
+  // of the table's index, removes the table from the catalog and puts its page
+  // chain and the listed pages on the free list. kNotFound, kCorrupt and
+  // kClosed as for AddColumn; a damaged index fails the statement before any
+  // change. When a catalog step fails the rows already deleted are inserted
+  // again; when only the release fails the table is gone and the message ends
+  // with `; statement was applied but its pages were not reclaimed`. The
+  // caller ensures a single writer and no reader of the table.
   Status DropTable(const std::string& table);
 
   Catalog& catalog() { return *catalog_; }
@@ -118,6 +137,9 @@ class Database {
   // serializes the opening of a heap, which several reader threads may request
   // at once. It is a unique_ptr so that Database stays movable.
   std::unordered_map<std::string, std::unique_ptr<TableHeap>> tables_;
+  // The index of each cached table that has one, under the same key and the
+  // same mutex. A table whose primary key is not an INT has no entry.
+  std::unordered_map<std::string, std::unique_ptr<BTree>> trees_;
   std::unique_ptr<std::mutex> tables_mutex_ = std::make_unique<std::mutex>();
   bool is_closed_ = false;
 };

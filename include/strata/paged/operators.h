@@ -8,6 +8,7 @@
 
 #include "strata/domain/plan.h"
 #include "strata/domain/value.h"
+#include "strata/paged/index_reader.h"
 #include "strata/paged/row_stream.h"
 
 // Pull-based query operators (design document 2.13). Pure: an operator
@@ -60,11 +61,16 @@ using BuildResult =
 // data row. A JoinNode picks HashJoinOperator when its condition has a
 // conjunct that equates one left column with one right column (ADR-0011), and
 // NestedLoopJoinOperator otherwise.
+// With a non-null index_reader, a FilterNode directly over a ScanNode of a
+// table with an index reads through IIndexReader::ScanRange when
+// ExtractKeyRange finds a range in its predicate (ADR-0052); the filter stays
+// and tests the whole predicate. A null index_reader reads only through reader.
 // Precondition: plan is a plan that the Binder produced, so column indexes are
 // inside the rows they are evaluated against and sort keys are inside the
 // output of their child.
 BuildResult BuildOperatorTree(const domain::PlanNode& plan,
-                              const ITableReader& reader);
+                              const ITableReader& reader,
+                              const IIndexReader* index_reader = nullptr);
 
 }  // namespace strata::paged
 

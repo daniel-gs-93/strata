@@ -210,7 +210,8 @@ std::variant<OpenedDatabase, std::string> OpenPagedDatabase(
   paged::PagedEngine* const paged_engine = engine.get();
   return OpenedDatabase{
       std::make_unique<application::QueryService>(
-          std::move(engine), std::make_unique<infrastructure::FileCsvSource>()),
+          std::move(engine), std::make_unique<infrastructure::FileCsvSource>(),
+          paged_engine),
       path,
       std::move(lock),
       std::move(tables),

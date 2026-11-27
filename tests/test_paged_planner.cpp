@@ -1,8 +1,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <variant>
@@ -10,6 +12,7 @@
 
 #include "strata/domain/plan.h"
 #include "strata/domain/value.h"
+#include "strata/paged/index_reader.h"
 #include "strata/paged/mutation_planner.h"
 #include "strata/paged/row_stream.h"
 #include "test_harness.h"
@@ -1179,4 +1182,352 @@ TEST(test_planner_rejects_non_write_node_and_unknown_table) {
     CHECK_EQ(deleted.plan->changes[0].table, "reactions");
     CHECK_EQ(deleted.plan->affected, static_cast<std::size_t>(5));
   }
+}
+
+namespace {
+
+// An IIndexReader over key sets that counts the Contains and ScanRange calls of
+// each table and can make every call of either kind fail. A table given its
+// rows with SetRows answers ScanRange with the rows of the range in ascending
+// key order and their Rids FakeRid(position in the vector given), as a real
+// index does; a table without rows answers with an empty stream.
+class FakeKeyIndex : public paged::IIndexReader {
+ public:
+  void AddIndexedTable(const std::string& name, std::size_t column,
+                       std::set<int64_t> keys) {
+    tables_[domain::ToLower(name)] =
+        Table{column, std::move(keys), 0, 0, {}, {}};
+  }
+  // Gives an indexed table its columns and rows, which ScanRange returns.
+  void SetRows(const std::string& name, const std::vector<ColumnDef>& columns,
+               const Rows& rows) {
+    Table& table = tables_.at(domain::ToLower(name));
+    table.columns = columns;
+    for (std::size_t position = 0; position < rows.size(); ++position) {
+      const int64_t key = std::get<int64_t>(rows[position][table.column]);
+      table.rows_by_key[key] =
+          paged::StoredRow{FakeRid(position), rows[position]};
+    }
+  }
+  void FailEveryContains(const std::string& message) { failure_ = message; }
+  void FailEveryScanRange(const std::string& message) {
+    range_failure_ = message;
+  }
+
+  std::optional<std::size_t> IndexedColumn(
+      const std::string& table) const override {
+    const auto found = tables_.find(domain::ToLower(table));
+    if (found == tables_.end()) {
+      return std::nullopt;
+    }
+    return found->second.column;
+  }
+
+  paged::ScanResult ScanRange(const std::string& table,
+                              const paged::KeyRange& range) const override {
+    Table& found = tables_.at(domain::ToLower(table));
+    ++found.range_calls;
+    if (range_failure_.has_value()) {
+      return ExecutionError{domain::ErrorKind::kIo, *range_failure_};
+    }
+    std::vector<paged::StoredRow> in_range;
+    if (!range.IsEmpty()) {
+      const std::optional<int64_t> first = range.FirstKey();
+      const std::optional<int64_t> last = range.LastKey();
+      for (const auto& [key, stored] : found.rows_by_key) {
+        if ((!first.has_value() || key >= *first) &&
+            (!last.has_value() || key <= *last)) {
+          in_range.push_back(stored);
+        }
+      }
+    }
+    return std::unique_ptr<paged::IRowStream>(
+        std::make_unique<strata::testing::VectorRowStream>(
+            found.columns, std::move(in_range)));
+  }
+
+  paged::ContainsResult Contains(const std::string& table,
+                                 int64_t key) const override {
+    Table& found = tables_.at(domain::ToLower(table));
+    ++found.contains_calls;
+    if (failure_.has_value()) {
+      return ExecutionError{domain::ErrorKind::kIo, *failure_};
+    }
+    return found.keys.contains(key);
+  }
+
+  std::size_t ContainsCallsOf(const std::string& table) const {
+    return tables_.at(domain::ToLower(table)).contains_calls;
+  }
+  std::size_t RangeCallsOf(const std::string& table) const {
+    return tables_.at(domain::ToLower(table)).range_calls;
+  }
+
+ private:
+  struct Table {
+    std::size_t column = 0;
+    std::set<int64_t> keys;
+    std::size_t contains_calls = 0;
+    std::size_t range_calls = 0;
+    std::vector<ColumnDef> columns;
+    std::map<int64_t, paged::StoredRow> rows_by_key;
+  };
+
+  mutable std::map<std::string, Table> tables_;
+  std::optional<std::string> failure_;
+  std::optional<std::string> range_failure_;
+};
+
+Planned PlanSqlWithIndex(const std::string& sql, const PlannerTables& tables,
+                         const paged::IIndexReader* index_reader) {
+  PlanPtr node = MustBind(sql, tables.catalog);
+  if (node == nullptr) {
+    return Planned{};
+  }
+  paged::PlanMutationResult result =
+      paged::PlanMutation(*node, tables.catalog, tables.reader, index_reader);
+  Planned planned;
+  if (auto* error = std::get_if<ExecutionError>(&result)) {
+    planned.error = std::move(*error);
+  } else {
+    planned.plan = std::move(std::get<paged::MutationPlan>(result));
+  }
+  return planned;
+}
+
+}  // namespace
+
+namespace {
+
+// items: an INT key, indexed. users: a UNIQUE column, so the other rows' values
+// are needed. counters: an auto-increment key. kids: a foreign key to items.id
+// (an indexed primary key) and one to users.email (UNIQUE, not the key).
+std::vector<ColumnDef> LabelColumns() {
+  return {Column("id", DataType::kInt), Column("label", DataType::kText)};
+}
+
+Rows ItemRows() {
+  return Rows{Row{Int(1), Text("a")}, Row{Int(2), Text("b")},
+              Row{Int(3), Text("c")}};
+}
+
+// The rows of `shuffled` are stored out of key order, so an index range read
+// and a table scan return them in different orders.
+Rows ShuffledRows() {
+  return Rows{Row{Int(3), Text("c")}, Row{Int(1), Text("a")},
+              Row{Int(2), Text("b")}};
+}
+
+PlannerTables IndexedTestTables() {
+  PlannerTables tables;
+  tables.Add(MakeSchema("items", LabelColumns(), {}, {}), ItemRows());
+  tables.Add(MakeSchema("shuffled", LabelColumns(), {}, {}), ShuffledRows());
+  tables.Add(MakeSchema("users",
+                        {Column("id", DataType::kInt),
+                         Column("email", DataType::kText)},
+                        {}, {1}),
+             Rows{Row{Int(1), Text("a@x")}});
+  TableSchema counters = MakeSchema(
+      "counters",
+      {Column("id", DataType::kInt), Column("label", DataType::kText)}, {}, {});
+  counters.auto_increment_index = 0;
+  tables.Add(counters, Rows{Row{Int(1), Text("a")}});
+  tables.Add(MakeSchema("kids",
+                        {Column("id", DataType::kInt),
+                         Column("item_id", DataType::kInt),
+                         Column("email", DataType::kText)},
+                        {domain::ForeignKey{1, "items", 0},
+                         domain::ForeignKey{2, "users", 1}},
+                        {}),
+             Rows{});
+  return tables;
+}
+
+FakeKeyIndex IndexedTestIndex() {
+  FakeKeyIndex index;
+  index.AddIndexedTable("items", 0, {1, 2, 3});
+  index.AddIndexedTable("shuffled", 0, {1, 2, 3});
+  index.AddIndexedTable("users", 0, {1});
+  index.AddIndexedTable("counters", 0, {1});
+  index.AddIndexedTable("kids", 0, {});
+  index.SetRows("items", LabelColumns(), ItemRows());
+  index.SetRows("shuffled", LabelColumns(), ShuffledRows());
+  return index;
+}
+
+// How often a table was scanned and asked with Contains, in one planning.
+struct TableCounts {
+  const char* table;
+  std::size_t scans;
+  std::size_t contains;
+};
+
+// How often a table was scanned and read through ScanRange, in one planning.
+struct RangeCounts {
+  const char* table;
+  std::size_t scans;
+  std::size_t ranges;
+};
+
+}  // namespace
+
+TEST(
+    test_paged_planner_uses_contains_and_ranges_when_an_index_reader_is_given) {
+  struct Case {
+    const char* sql;
+    std::vector<TableCounts> counts;  // the tables not listed have 0 and 0
+  };
+  const Case cases[] = {
+      // No UNIQUE column, no generated value: no scan, one Contains per row.
+      {"INSERT INTO items VALUES (4, 'x'), (5, 'y')", {{"items", 0, 2}}},
+      // A duplicate of an existing key, and of an earlier row of the statement:
+      // the second is found in the key sets, without a Contains call.
+      {"INSERT INTO items VALUES (2, 'x')", {{"items", 0, 1}}},
+      {"INSERT INTO items VALUES (7, 'x'), (7, 'y')", {{"items", 0, 1}}},
+      // A UNIQUE column and a generated value still scan the target.
+      {"INSERT INTO users VALUES (2, 'b@x')", {{"users", 1, 0}}},
+      {"INSERT INTO counters (label) VALUES ('x')", {{"counters", 1, 0}}},
+      // A foreign key to an indexed primary key is checked by Contains, and its
+      // parent is not scanned; a foreign key to a UNIQUE column scans its
+      // parent. kids has no UNIQUE column, so its own key is looked up too.
+      {"INSERT INTO kids VALUES (5, 2, 'a@x')",
+       {{"kids", 0, 1}, {"items", 0, 1}, {"users", 1, 0}}},
+      // A missing parent row ends the checks before the second foreign key.
+      {"INSERT INTO kids VALUES (5, 9, 'a@x')",
+       {{"kids", 0, 1}, {"items", 0, 1}}}};
+  for (const Case& test_case : cases) {
+    // The run without an index reader is the reference.
+    const PlannerTables reference_tables = IndexedTestTables();
+    const Planned expected =
+        PlanSqlWithIndex(test_case.sql, reference_tables, nullptr);
+    const PlannerTables tables = IndexedTestTables();
+    const FakeKeyIndex index = IndexedTestIndex();
+    const Planned actual = PlanSqlWithIndex(test_case.sql, tables, &index);
+    CHECK(Report(actual) == Report(expected));
+    for (const char* name : {"items", "users", "counters", "kids"}) {
+      std::size_t expected_scans = 0;
+      std::size_t expected_contains = 0;
+      for (const TableCounts& counts : test_case.counts) {
+        if (std::string(counts.table) == name) {
+          expected_scans = counts.scans;
+          expected_contains = counts.contains;
+        }
+      }
+      // An INSERT never reads a range.
+      if (tables.ScansOf(name) != expected_scans ||
+          index.ContainsCallsOf(name) != expected_contains ||
+          index.RangeCallsOf(name) != 0) {
+        // Shows which statement and table differ.
+        CHECK_EQ(std::string(test_case.sql) + " " + name + " scans " +
+                     std::to_string(tables.ScansOf(name)) + " contains " +
+                     std::to_string(index.ContainsCallsOf(name)) + " ranges " +
+                     std::to_string(index.RangeCallsOf(name)),
+                 std::string(test_case.sql) + " " + name + " scans " +
+                     std::to_string(expected_scans) + " contains " +
+                     std::to_string(expected_contains) + " ranges 0");
+      }
+    }
+  }
+
+  // A Contains that fails makes PlanMutation return its error.
+  const PlannerTables tables = IndexedTestTables();
+  FakeKeyIndex failing = IndexedTestIndex();
+  failing.FailEveryContains("injected contains failure");
+  const Planned failed =
+      PlanSqlWithIndex("INSERT INTO items VALUES (4, 'x')", tables, &failing);
+  CHECK(Report(failed) == ErrorReport("io", "injected contains failure"));
+}
+
+// UPDATE and DELETE read the rows of a WHERE that has a key range with
+// ScanRange, and every other WHERE with Scan.
+TEST(test_paged_planner_reads_where_through_the_index_for_update_and_delete) {
+  struct RangeCase {
+    const char* sql;
+    std::vector<RangeCounts> counts;  // the tables not listed have 0 and 0
+  };
+  const RangeCase range_cases[] = {
+      {"UPDATE items SET label = 'z' WHERE id = 2", {{"items", 0, 1}}},
+      {"UPDATE items SET label = 'z' WHERE id >= 2 AND label <> 'c'",
+       {{"items", 0, 1}}},
+      {"UPDATE items SET label = 'z' WHERE label = 'b'", {{"items", 1, 0}}},
+      {"UPDATE items SET label = 'z'", {{"items", 1, 0}}},
+      // An assigned UNIQUE column needs the rows that the WHERE does not
+      // select, so the target is scanned; kids is scanned for the cascade.
+      {"UPDATE users SET email = 'b@x' WHERE id = 1",
+       {{"users", 1, 0}, {"kids", 1, 0}}},
+      // A DELETE also scans each table that references the target.
+      {"DELETE FROM items WHERE id = 2", {{"items", 0, 1}, {"kids", 1, 0}}},
+      {"DELETE FROM items WHERE id = 1 OR id = 3",
+       {{"items", 1, 0}, {"kids", 1, 0}}},
+      {"DELETE FROM items", {{"items", 1, 0}, {"kids", 1, 0}}},
+      // An empty range still reads ScanRange, selects nothing and scans no
+      // child table.
+      {"DELETE FROM items WHERE id = 3 AND id = 4", {{"items", 0, 1}}}};
+  for (const RangeCase& test_case : range_cases) {
+    const PlannerTables reference_tables = IndexedTestTables();
+    const Planned expected =
+        PlanSqlWithIndex(test_case.sql, reference_tables, nullptr);
+    const PlannerTables tables = IndexedTestTables();
+    const FakeKeyIndex index = IndexedTestIndex();
+    const Planned actual = PlanSqlWithIndex(test_case.sql, tables, &index);
+    CHECK(Report(actual) == Report(expected));
+    for (const char* name : {"items", "users", "kids"}) {
+      std::size_t expected_scans = 0;
+      std::size_t expected_ranges = 0;
+      for (const RangeCounts& counts : test_case.counts) {
+        if (std::string(counts.table) == name) {
+          expected_scans = counts.scans;
+          expected_ranges = counts.ranges;
+        }
+      }
+      if (tables.ScansOf(name) != expected_scans ||
+          index.RangeCallsOf(name) != expected_ranges ||
+          index.ContainsCallsOf(name) != 0) {
+        CHECK_EQ(std::string(test_case.sql) + " " + name + " scans " +
+                     std::to_string(tables.ScansOf(name)) + " ranges " +
+                     std::to_string(index.RangeCallsOf(name)) + " contains " +
+                     std::to_string(index.ContainsCallsOf(name)),
+                 std::string(test_case.sql) + " " + name + " scans " +
+                     std::to_string(expected_scans) + " ranges " +
+                     std::to_string(expected_ranges) + " contains 0");
+      }
+    }
+  }
+
+  // The rows of a range come in key order with their own Rids, where a scan
+  // returns them in storage order.
+  const PlannerTables storage_tables = IndexedTestTables();
+  const Planned in_storage_order = PlanSqlWithIndex(
+      "DELETE FROM shuffled WHERE id >= 1", storage_tables, nullptr);
+  CHECK(
+      Report(in_storage_order) ==
+      (std::vector<std::string>{"affected 3", "shuffled - @1.0 3|c",
+                                "shuffled - @1.1 1|a", "shuffled - @1.2 2|b"}));
+  const PlannerTables key_tables = IndexedTestTables();
+  const FakeKeyIndex key_index = IndexedTestIndex();
+  const Planned in_key_order = PlanSqlWithIndex(
+      "DELETE FROM shuffled WHERE id >= 1", key_tables, &key_index);
+  CHECK(
+      Report(in_key_order) ==
+      (std::vector<std::string>{"affected 3", "shuffled - @1.1 1|a",
+                                "shuffled - @1.2 2|b", "shuffled - @1.0 3|c"}));
+  const PlannerTables update_tables = IndexedTestTables();
+  const FakeKeyIndex update_index = IndexedTestIndex();
+  const Planned updated_in_key_order =
+      PlanSqlWithIndex("UPDATE shuffled SET label = 'z' WHERE id >= 2",
+                       update_tables, &update_index);
+  CHECK(Report(updated_in_key_order) ==
+        (std::vector<std::string>{"affected 2", "shuffled ~ @1.2 2|b => 2|z",
+                                  "shuffled ~ @1.0 3|c => 3|z"}));
+
+  // A ScanRange that fails makes PlanMutation return its error, for both.
+  FakeKeyIndex failing_range = IndexedTestIndex();
+  failing_range.FailEveryScanRange("injected range failure");
+  const PlannerTables range_tables = IndexedTestTables();
+  CHECK(Report(PlanSqlWithIndex("DELETE FROM items WHERE id = 2", range_tables,
+                                &failing_range)) ==
+        ErrorReport("io", "injected range failure"));
+  CHECK(Report(PlanSqlWithIndex("UPDATE items SET label = 'z' WHERE id = 2",
+                                range_tables, &failing_range)) ==
+        ErrorReport("io", "injected range failure"));
 }

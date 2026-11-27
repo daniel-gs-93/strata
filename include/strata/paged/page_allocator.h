@@ -53,6 +53,20 @@ class PageAllocator {
   // formatted before the error are free pages that no list reaches.
   Status Release(PageId first_page);
 
+  // Puts an explicit list of pages on the free list, for pages that no chain
+  // links, such as the nodes of an index tree. Formats each page as a free page
+  // linked to the next in list order, links the last page to the old head and
+  // sets the head to the first page, last, as Release does. Every page must be
+  // a heap page or an index node at or above page 3, inside the file, and
+  // listed once; the whole list is checked before the first page changes, so
+  // after any of these errors the head and every page are unchanged.
+  // kInvalidArgument: a page below 3. kCorrupt: a page past the end of the
+  // file, a page listed twice, or a page that is not a heap page or an index
+  // node. An empty list does nothing. A read or write that fails after the
+  // check leaves the head unchanged and some pages formatted as free pages that
+  // no list reaches. The pages must belong to no table and no tree any more.
+  Status ReleasePages(const std::vector<PageId>& pages);
+
   // The free pages in list order, from a walk that also checks the list:
   // kCorrupt for a page outside the file, a page visited twice and a page that
   // is not a free page. O(F) page reads for F free pages.

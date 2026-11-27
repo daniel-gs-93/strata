@@ -304,6 +304,12 @@ TEST(test_paged_heap_rejects_invalid_arguments) {
   CHECK_OK(other_first);
   if (other_first.ok()) {
     CHECK_ERROR(env.heap().Get(Rid{other_first.value(), 0}), kInvalidArgument);
+    // Update and Delete check the owner of the page before they touch it, and
+    // an empty page of another table has no slot 0 to fail on instead.
+    CHECK_ERROR(env.heap().Update(Rid{other_first.value(), 0}, PersonRow(1, 5)),
+                kInvalidArgument);
+    CHECK_ERROR(env.heap().Delete(Rid{other_first.value(), 0}),
+                kInvalidArgument);
   }
   CHECK_ERROR(env.heap().Get(Rid{9999, 0}), kNotFound);
 }

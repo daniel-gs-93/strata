@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "strata/domain/expression.h"
+#include "strata/paged/key_range.h"
 #include "strata/paged/row_keys.h"
 
 // Pure logic: every operator reads rows from its child (or, at a leaf, from an
@@ -851,14 +852,21 @@ BuildResult Built(std::unique_ptr<IOperator> root) {
   return BuildResult(std::move(root));
 }
 
-BuildResult BuildNode(const PlanNode& plan, const ITableReader& reader);
+// What building a tree reads from: the table reader and, when the engine has
+// indexes, the index reader (null otherwise).
+struct BuildContext {
+  const ITableReader& reader;
+  const IIndexReader* index_reader;
+};
+
+BuildResult BuildNode(const PlanNode& plan, const BuildContext& context);
 
 // Builds the operator of the child plan into *child. Returns the error when
 // the child cannot be built.
 std::optional<ExecutionError> BuildChild(const PlanPtr& plan,
-                                         const ITableReader& reader,
+                                         const BuildContext& context,
                                          std::unique_ptr<IOperator>* child) {
-  BuildResult built = BuildNode(*plan, reader);
+  BuildResult built = BuildNode(*plan, context);
   if (auto* error = std::get_if<ExecutionError>(&built)) {
     return std::move(*error);
   }
@@ -867,8 +875,8 @@ std::optional<ExecutionError> BuildChild(const PlanPtr& plan,
 }
 
 BuildResult BuildScan(const domain::ScanNode& scan,
-                      const ITableReader& reader) {
-  ScanResult opened = reader.Scan(scan.table);
+                      const BuildContext& context) {
+  ScanResult opened = context.reader.Scan(scan.table);
   if (auto* error = std::get_if<ExecutionError>(&opened)) {
     return std::move(*error);
   }
@@ -876,10 +884,46 @@ BuildResult BuildScan(const domain::ScanNode& scan,
       std::move(std::get<std::unique_ptr<IRowStream>>(opened))));
 }
 
+// A filter directly over the scan of a table with an index reads through the
+// index when its predicate gives a key range (ADR-0052). The filter stays above
+// the scan and tests the whole predicate on every row, so the range only
+// narrows the rows. No value means the filter is built the ordinary way.
+std::optional<BuildResult> BuildIndexScan(const domain::FilterNode& filter,
+                                          const BuildContext& context) {
+  if (context.index_reader == nullptr) {
+    return std::nullopt;
+  }
+  const auto* scan = std::get_if<domain::ScanNode>(&filter.child->node);
+  if (scan == nullptr) {
+    return std::nullopt;
+  }
+  const std::optional<std::size_t> column =
+      context.index_reader->IndexedColumn(scan->table);
+  if (!column.has_value()) {
+    return std::nullopt;
+  }
+  const std::optional<KeyRange> range =
+      ExtractKeyRange(*filter.predicate, *column);
+  if (!range.has_value()) {
+    return std::nullopt;
+  }
+  ScanResult opened = context.index_reader->ScanRange(scan->table, *range);
+  if (auto* error = std::get_if<ExecutionError>(&opened)) {
+    return BuildResult(std::move(*error));
+  }
+  std::unique_ptr<IOperator> source = std::make_unique<ScanOperator>(
+      std::move(std::get<std::unique_ptr<IRowStream>>(opened)));
+  return Built(std::make_unique<FilterOperator>(std::move(source),
+                                                filter.predicate.get()));
+}
+
 BuildResult BuildFilter(const domain::FilterNode& filter,
-                        const ITableReader& reader) {
+                        const BuildContext& context) {
+  if (std::optional<BuildResult> indexed = BuildIndexScan(filter, context)) {
+    return std::move(*indexed);
+  }
   std::unique_ptr<IOperator> child;
-  if (auto error = BuildChild(filter.child, reader, &child)) {
+  if (auto error = BuildChild(filter.child, context, &child)) {
     return std::move(*error);
   }
   return Built(std::make_unique<FilterOperator>(std::move(child),
@@ -887,13 +931,13 @@ BuildResult BuildFilter(const domain::FilterNode& filter,
 }
 
 BuildResult BuildJoin(const domain::JoinNode& join,
-                      const ITableReader& reader) {
+                      const BuildContext& context) {
   std::unique_ptr<IOperator> left;
-  if (auto error = BuildChild(join.left, reader, &left)) {
+  if (auto error = BuildChild(join.left, context, &left)) {
     return std::move(*error);
   }
   std::unique_ptr<IOperator> right;
-  if (auto error = BuildChild(join.right, reader, &right)) {
+  if (auto error = BuildChild(join.right, context, &right)) {
     return std::move(*error);
   }
   JoinSpec spec = MakeJoinSpec(join.condition.get(), left->Columns().size(),
@@ -908,9 +952,9 @@ BuildResult BuildJoin(const domain::JoinNode& join,
 }
 
 BuildResult BuildAggregate(const domain::AggregateNode& aggregate,
-                           const ITableReader& reader) {
+                           const BuildContext& context) {
   std::unique_ptr<IOperator> child;
-  if (auto error = BuildChild(aggregate.child, reader, &child)) {
+  if (auto error = BuildChild(aggregate.child, context, &child)) {
     return std::move(*error);
   }
   return Built(
@@ -918,18 +962,18 @@ BuildResult BuildAggregate(const domain::AggregateNode& aggregate,
 }
 
 BuildResult BuildProject(const domain::ProjectNode& project,
-                         const ITableReader& reader) {
+                         const BuildContext& context) {
   std::unique_ptr<IOperator> child;
-  if (auto error = BuildChild(project.child, reader, &child)) {
+  if (auto error = BuildChild(project.child, context, &child)) {
     return std::move(*error);
   }
   return Built(std::make_unique<ProjectOperator>(std::move(child), &project));
 }
 
 BuildResult BuildSort(const domain::SortNode& sort,
-                      const ITableReader& reader) {
+                      const BuildContext& context) {
   std::unique_ptr<IOperator> child;
-  if (auto error = BuildChild(sort.child, reader, &child)) {
+  if (auto error = BuildChild(sort.child, context, &child)) {
     return std::move(*error);
   }
   for (const domain::SortKey& key : sort.keys) {
@@ -939,45 +983,45 @@ BuildResult BuildSort(const domain::SortNode& sort,
 }
 
 BuildResult BuildLimit(const domain::LimitNode& limit,
-                       const ITableReader& reader) {
+                       const BuildContext& context) {
   std::unique_ptr<IOperator> child;
-  if (auto error = BuildChild(limit.child, reader, &child)) {
+  if (auto error = BuildChild(limit.child, context, &child)) {
     return std::move(*error);
   }
   return Built(std::make_unique<LimitOperator>(std::move(child), limit.limit,
                                                limit.offset));
 }
 
-BuildResult BuildNode(const PlanNode& plan, const ITableReader& reader) {
+BuildResult BuildNode(const PlanNode& plan, const BuildContext& context) {
   if (const auto* scan = std::get_if<domain::ScanNode>(&plan.node)) {
-    return BuildScan(*scan, reader);
+    return BuildScan(*scan, context);
   }
   if (const auto* filter = std::get_if<domain::FilterNode>(&plan.node)) {
-    return BuildFilter(*filter, reader);
+    return BuildFilter(*filter, context);
   }
   if (const auto* join = std::get_if<domain::JoinNode>(&plan.node)) {
-    return BuildJoin(*join, reader);
+    return BuildJoin(*join, context);
   }
   if (const auto* aggregate = std::get_if<domain::AggregateNode>(&plan.node)) {
-    return BuildAggregate(*aggregate, reader);
+    return BuildAggregate(*aggregate, context);
   }
   if (const auto* project = std::get_if<domain::ProjectNode>(&plan.node)) {
-    return BuildProject(*project, reader);
+    return BuildProject(*project, context);
   }
   if (const auto* sort = std::get_if<domain::SortNode>(&plan.node)) {
-    return BuildSort(*sort, reader);
+    return BuildSort(*sort, context);
   }
   if (const auto* limit = std::get_if<domain::LimitNode>(&plan.node)) {
-    return BuildLimit(*limit, reader);
+    return BuildLimit(*limit, context);
   }
   return ExecutionError{ErrorKind::kUnsupported, "not a query plan node"};
 }
 
 }  // namespace
 
-BuildResult BuildOperatorTree(const PlanNode& plan,
-                              const ITableReader& reader) {
-  return BuildNode(plan, reader);
+BuildResult BuildOperatorTree(const PlanNode& plan, const ITableReader& reader,
+                              const IIndexReader* index_reader) {
+  return BuildNode(plan, BuildContext{reader, index_reader});
 }
 
 }  // namespace strata::paged

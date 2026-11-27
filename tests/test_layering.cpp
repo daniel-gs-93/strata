@@ -189,7 +189,8 @@ const char* const kPagedComposer = "bootstrap.cpp";
 // the domain, the shared types and each other, but nothing that does I/O,
 // locks or pins (docs/DesignDocument.md section 2.1).
 bool IsPagedByteLayerFile(const std::string& path) {
-  const char* const names[] = {"tuple_codec", "slotted_page", "crc32c"};
+  const char* const names[] = {"tuple_codec", "slotted_page", "crc32c",
+                               "btree_node"};
   for (const char* name : names) {
     if (path == std::string("strata/paged/") + name + ".h" ||
         path == std::string("paged/") + name + ".cpp") {
@@ -202,8 +203,8 @@ bool IsPagedByteLayerFile(const std::string& path) {
 bool IsPagedByteLayerHeader(const std::string& header) {
   const char* const allowed[] = {
       "strata/paged/paged_types.h", "strata/paged/byte_codec.h",
-      "strata/paged/crc32c.h", "strata/paged/slotted_page.h",
-      "strata/paged/tuple_codec.h"};
+      "strata/paged/crc32c.h",      "strata/paged/slotted_page.h",
+      "strata/paged/tuple_codec.h", "strata/paged/btree_node.h"};
   for (const char* candidate : allowed) {
     if (header == candidate) {
       return true;
@@ -279,8 +280,9 @@ namespace {
 // the keys they use, which read rows only through IRowStream (design document
 // 2.1). It may include the domain, the shared types, the byte layer's tuple
 // codec and its own files, and nothing that pins, locks or does I/O.
-const char* const kRowLayerNames[] = {"row_stream", "row_keys", "operators",
-                                      "mutation_planner"};
+const char* const kRowLayerNames[] = {"row_stream",   "row_keys",
+                                      "operators",    "mutation_planner",
+                                      "index_reader", "key_range"};
 
 bool IsRowLayerFile(const std::string& path) {
   for (const char* name : kRowLayerNames) {
@@ -395,11 +397,11 @@ TEST(test_layering_row_layer_and_bootstrap_rules) {
   const RowLayerScan include_scan = ScanRowLayerRules(source_dir / "include");
   const RowLayerScan source_scan = ScanRowLayerRules(source_dir / "src");
 
-  // An empty scan would pass vacuously: the four row layer headers, the three
-  // row layer sources (row_stream has none), application.h and .cpp, and
-  // bootstrap.h and .cpp must all have been found.
-  CHECK_EQ(include_scan.row_layer_files, 4);
-  CHECK_EQ(source_scan.row_layer_files, 3);
+  // An empty scan would pass vacuously: the six row layer headers, the four
+  // row layer sources (row_stream and index_reader have none), application.h
+  // and .cpp, and bootstrap.h and .cpp must all have been found.
+  CHECK_EQ(include_scan.row_layer_files, 6);
+  CHECK_EQ(source_scan.row_layer_files, 4);
   CHECK_EQ(include_scan.application_files, 1);
   CHECK_EQ(source_scan.application_files, 1);
   CHECK_EQ(include_scan.bootstrap_files, 1);

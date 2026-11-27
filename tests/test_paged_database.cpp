@@ -177,7 +177,7 @@ TEST(test_paged_database_creates_a_new_file) {
     return;
   }
   CHECK(std::memcmp(bytes.data() + 32, "PAGEDDB", 8) == 0);
-  CHECK_EQ(ReadLe32(bytes.data() + 40), 1u);
+  CHECK_EQ(ReadLe32(bytes.data() + 40), 2u);
   CHECK_EQ(ReadLe32(bytes.data() + 44), 4096u);
   CHECK_EQ(ReadLe32(bytes.data() + 48), 3u);
   CHECK_EQ(ReadLe32(bytes.data() + 52), 1u);
@@ -239,7 +239,7 @@ void ApplyHeaderDamage(std::vector<std::uint8_t>& bytes, HeaderDamage damage) {
       bytes[33] ^= 0x01;
       break;
     case HeaderDamage::kFormatVersion:
-      WriteLe32(bytes.data() + 40, 2);
+      WriteLe32(bytes.data() + 40, 3);
       break;
     case HeaderDamage::kPageSize:
       WriteLe32(bytes.data() + 44, 8192);
@@ -295,6 +295,38 @@ TEST(test_paged_database_rejects_invalid_headers) {
     auto opened = Database::Open(directory.path(), options);
     CHECK_ERROR(opened, kCorrupt);
     CHECK_MESSAGE_CONTAINS(opened, item.expected_word);
+    CHECK(BytesOfFile(FilePathIn(directory)) == bytes);
+  }
+}
+
+TEST(test_paged_database_refuses_format_version_1) {
+  const std::vector<std::uint8_t> valid = ValidFileBytes();
+  CHECK(valid.size() >= 3 * kPageBytes);
+  if (valid.size() < 3 * kPageBytes) {
+    return;
+  }
+  // A new file has format version 2, and the bytes of page 0 from offset 64
+  // are reserved and zero.
+  CHECK_EQ(ReadLe32(valid.data() + 40), 2u);
+  bool is_reserved_zero = true;
+  for (std::size_t offset = 64; offset < kPageBytes; ++offset) {
+    is_reserved_zero = is_reserved_zero && valid[offset] == 0;
+  }
+  CHECK(is_reserved_zero);
+
+  // Version 1 and version 3, each with a valid checksum, are refused.
+  const std::uint32_t versions[] = {1, 3};
+  for (std::uint32_t version : versions) {
+    std::vector<std::uint8_t> bytes = valid;
+    WriteLe32(bytes.data() + 40, version);
+    SlottedPage::SealChecksum(bytes.data());
+    TempDir directory;
+    WriteBytes(FilePathIn(directory), bytes);
+    DatabaseOptions options;
+    auto opened = Database::Open(directory.path(), options);
+    CHECK_ERROR(opened, kCorrupt);
+    CHECK_MESSAGE_CONTAINS(opened, "format_version " + std::to_string(version) +
+                                       " is not supported (expected 2)");
     CHECK(BytesOfFile(FilePathIn(directory)) == bytes);
   }
 }
@@ -826,7 +858,7 @@ TEST(test_paged_database_policy_switch_changes_misses_not_results) {
   }
   CHECK(outcomes[0] == outcomes[1]);
   CHECK_EQ(last_misses[0], static_cast<std::uint64_t>(4));
-  CHECK(last_misses[1] < last_misses[0]);
+  CHECK_EQ(last_misses[1], static_cast<std::uint64_t>(0));
 }
 
 namespace {

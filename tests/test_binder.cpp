@@ -2,9 +2,11 @@
 // docs/DesignDocument.md section 2.4.
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -53,6 +55,41 @@ void ExpectBindFailure(const char* file, int line, const std::string& sql,
 domain::PlanPtr BindOrFail(const std::string& sql) {
   FakeCatalog catalog;
   return MustBind(sql, catalog);
+}
+
+// A catalog of one table, wide, whose INT columns are c0, c1, and so on.
+class WideCatalog : public domain::ICatalog {
+ public:
+  explicit WideCatalog(std::size_t column_count) {
+    schema_.name = "wide";
+    for (std::size_t column = 0; column < column_count; ++column) {
+      schema_.columns.push_back(domain::ColumnDef{"c" + std::to_string(column),
+                                                  domain::DataType::kInt});
+    }
+    schema_.primary_key_index = 0;
+  }
+
+  std::optional<domain::TableSchema> FindTable(
+      const std::string& name) const override {
+    if (domain::ToLower(name) == schema_.name) {
+      return schema_;
+    }
+    return std::nullopt;
+  }
+
+  std::vector<std::string> TableNames() const override { return {"wide"}; }
+
+ private:
+  domain::TableSchema schema_;
+};
+
+// The message of a statement that must fail to bind.
+std::string BindMessage(const std::string& sql,
+                        const domain::ICatalog& catalog) {
+  domain::BindResult result = domain::Bind(MustParse(sql), catalog);
+  const auto* error = std::get_if<domain::ExecutionError>(&result);
+  CHECK(error != nullptr);
+  return error == nullptr ? std::string() : error->message;
 }
 
 template <typename Node>
@@ -1261,6 +1298,30 @@ TEST(test_binder_suggests_close_names_for_unknown_tables_and_columns) {
   if (three_edits_error != nullptr) {
     CHECK(three_edits_error->message.find("did you mean") == std::string::npos);
   }
+}
+
+TEST(test_binder_suggestion_skips_a_name_far_longer_than_the_columns) {
+  // A table of 4000 columns and a name of 100000 characters: an edit distance
+  // against every column takes seconds, and no column is within two edits of a
+  // name that is 99990 characters longer.
+  constexpr std::size_t kColumnCount = 4000;
+  constexpr std::size_t kNameLength = 100000;
+  constexpr double kSecondsLimit = 1.0;
+  const WideCatalog catalog(kColumnCount);
+  const std::string long_name(kNameLength, 'a');
+
+  const auto start = std::chrono::steady_clock::now();
+  const std::string far_message =
+      BindMessage("SELECT " + long_name + " FROM wide", catalog);
+  const std::chrono::duration<double> elapsed =
+      std::chrono::steady_clock::now() - start;
+  const std::string close_message =
+      BindMessage("SELECT c12x FROM wide", catalog);
+
+  CHECK(far_message.find("unknown column") != std::string::npos);
+  CHECK(far_message.find("did you mean") == std::string::npos);
+  CHECK(close_message.find("; did you mean c12?") != std::string::npos);
+  CHECK(elapsed.count() < kSecondsLimit);
 }
 
 }  // namespace strata::testing

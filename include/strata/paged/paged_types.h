@@ -29,6 +29,18 @@ inline constexpr std::size_t kMaxTupleSize =
     kPageSize - kPageHeaderSize - kSlotSize;
 inline constexpr PageId kInvalidPageId = 0xFFFFFFFFu;
 
+// The system tables and the pages their heap chains start on. Pages 1 and 2
+// hold sys_tables and sys_columns, so the first page a user table can own is 3.
+// The first user table id and the first user page are equal by accident: the
+// first is a rule about table ids, the second a rule about which pages
+// PageAllocator may release (design document 2.10).
+inline constexpr std::uint32_t kSysTablesId = 1;
+inline constexpr std::uint32_t kSysColumnsId = 2;
+inline constexpr std::uint32_t kFirstUserTableId = 3;
+inline constexpr PageId kSysTablesPage = 1;
+inline constexpr PageId kSysColumnsPage = 2;
+inline constexpr PageId kFirstUserPage = 3;
+
 // Byte positions of the fixed-width little-endian fields (design document
 // 2.10). Every page starts with the common header; page 0 continues with the
 // file header.
@@ -60,7 +72,8 @@ enum class PageType : std::uint8_t {
   kUnformatted = 0,
   kFileHeader = 1,
   kHeapData = 2,
-  kFree = 3
+  kFree = 3,
+  kIndexNode = 4
 };
 
 enum class LatchMode { kShared, kExclusive };

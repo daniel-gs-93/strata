@@ -422,6 +422,17 @@ TEST(test_paged_buffer_propagates_io_failures_without_losing_data) {
     CHECK_EQ(FetchAndRelease(*buffer, 3), "ok");
     const auto stats = buffer->Stats();
     CHECK_EQ(stats.hits + stats.misses, static_cast<std::uint64_t>(2));
+    // The frame of the failed read went back to the pool: all four frames are
+    // still usable, so four other pages can be pinned at once.
+    std::vector<PageGuard> guards;
+    for (PageId page = 4; page < 8; ++page) {
+      auto result = buffer->FetchPage(page, LatchMode::kShared);
+      CHECK_OK(result);
+      if (result.ok()) {
+        guards.push_back(std::move(result).value());
+      }
+    }
+    CHECK_EQ(guards.size(), static_cast<std::size_t>(4));
   }
   // (b) The write-back of a dirty victim fails: the victim stays resident and
   // dirty, no eviction is counted, and nothing is lost.

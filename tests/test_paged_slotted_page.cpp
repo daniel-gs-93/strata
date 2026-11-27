@@ -424,15 +424,15 @@ TEST(test_paged_slotted_page_verifies_free_pages) {
   SlottedPage::SealChecksum(page.data());
   CHECK(SlottedPage::VerifyHeader(page.data(), 7) == std::nullopt);
 
-  // Page type 4 does not exist.
+  // Page type 5 does not exist (type 4 is an index node).
   Page unknown_type = page;
-  unknown_type[8] = 4;
+  unknown_type[8] = 5;
   SlottedPage::SealChecksum(unknown_type.data());
   const auto unknown_status = SlottedPage::VerifyHeader(unknown_type.data(), 7);
   CHECK(unknown_status.has_value());
   if (unknown_status.has_value()) {
     CHECK(unknown_status->code == strata::paged::PageErrorCode::kCorrupt);
-    CHECK(unknown_status->message.find("page_type 4") != std::string::npos);
+    CHECK(unknown_status->message.find("page_type 5") != std::string::npos);
   }
 
   // A slot array that reaches past free_end.

@@ -3,11 +3,13 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <string>
 #include <vector>
 
 #include "strata/domain/ast.h"
 #include "strata/domain/engine.h"
 #include "strata/domain/import.h"
+#include "strata/domain/index_inspector.h"
 #include "strata/domain/value.h"
 
 namespace strata::application {
@@ -32,15 +34,20 @@ namespace strata::application {
 // mutex). Code that holds any of them never calls into QueryService, so no
 // thread waits for this lock while holding one of those.
 //
-// All three member functions may be called from several threads at the same
-// time. The object is neither copyable nor movable (the mutex); callers hold it
-// behind a std::unique_ptr.
+// DescribeIndex takes the lock shared, as DescribeCatalog does. All four member
+// functions may be called from several threads at the same time. The object is
+// neither copyable nor movable (the mutex); callers hold it behind a
+// std::unique_ptr.
 class QueryService {
  public:
   // csv_source serves ImportCsv; without it ImportCsv reports kUnsupported.
+  // index_inspector serves DescribeIndex. It is borrowed, not owned, and must
+  // outlive this object: it is the engine itself (or a part of it), which this
+  // object owns. Null for an engine that has no indexes.
   explicit QueryService(
       std::unique_ptr<domain::IEngine> engine,
-      std::unique_ptr<domain::ICsvSource> csv_source = nullptr);
+      std::unique_ptr<domain::ICsvSource> csv_source = nullptr,
+      domain::IIndexInspector* index_inspector = nullptr);
 
   // Borrows statement for the duration of the call.
   domain::ExecutionResult Execute(const domain::Statement& statement);
@@ -56,9 +63,16 @@ class QueryService {
   // <m>])" and whose notes describe the skipped rows, or an ExecutionError.
   domain::ExecutionResult ImportCsv(const domain::ImportRequest& request);
 
+  // The shape and the check of the index of a table (the data of the `.dump
+  // index` command), under the shared lock. A kUnsupported error "the flatfile
+  // engine has no indexes" when no inspector was given; otherwise the result of
+  // IIndexInspector::DescribeIndex.
+  domain::IndexDescriptionResult DescribeIndex(const std::string& table) const;
+
  private:
   std::unique_ptr<domain::IEngine> engine_;
   std::unique_ptr<domain::ICsvSource> csv_source_;
+  domain::IIndexInspector* index_inspector_;
   // The database-level lock; mutable so that DescribeCatalog() const can take
   // it shared.
   mutable std::shared_mutex database_mutex_;

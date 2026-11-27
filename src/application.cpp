@@ -29,8 +29,11 @@ domain::ExecutionResult BindAndExecute(domain::IEngine& engine,
 }  // namespace
 
 QueryService::QueryService(std::unique_ptr<domain::IEngine> engine,
-                           std::unique_ptr<domain::ICsvSource> csv_source)
-    : engine_(std::move(engine)), csv_source_(std::move(csv_source)) {}
+                           std::unique_ptr<domain::ICsvSource> csv_source,
+                           domain::IIndexInspector* index_inspector)
+    : engine_(std::move(engine)),
+      csv_source_(std::move(csv_source)),
+      index_inspector_(index_inspector) {}
 
 domain::ExecutionResult QueryService::Execute(
     const domain::Statement& statement) {
@@ -54,6 +57,16 @@ std::vector<domain::TableSchema> QueryService::DescribeCatalog() const {
     }
   }
   return schemas;
+}
+
+domain::IndexDescriptionResult QueryService::DescribeIndex(
+    const std::string& table) const {
+  std::shared_lock<std::shared_mutex> read_lock(database_mutex_);
+  if (index_inspector_ == nullptr) {
+    return domain::ExecutionError{domain::ErrorKind::kUnsupported,
+                                  "the flatfile engine has no indexes"};
+  }
+  return index_inspector_->DescribeIndex(table);
 }
 
 domain::ExecutionResult QueryService::ImportCsv(

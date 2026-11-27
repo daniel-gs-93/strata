@@ -953,3 +953,165 @@ TEST(test_query_service_concurrent_readers_see_whole_statements) {
     RunReadersAndWriter("flatfile", *service);
   }
 }
+
+// ----------------------------------------------------------------------------
+// DescribeIndex.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// An engine that is also an index inspector. A DescribeIndex call waits inside
+// until `target` calls are inside and the test has not asked to hold them; an
+// Execute notes whether a DescribeIndex call was inside when it entered.
+class InspectorEngine : public domain::IEngine, public domain::IIndexInspector {
+ public:
+  // The next calls leave once `target` are inside, and not before Release when
+  // `is_held` is set.
+  void Expect(int target, bool is_held) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    target_ = target;
+    is_held_ = is_held;
+    peak_inside_ = 0;
+  }
+
+  void Release() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    is_held_ = false;
+    changed_.notify_all();
+  }
+
+  // True when `count` calls are inside the inspector.
+  bool WaitUntilInside(int count) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return changed_.wait_for(lock, kHangGuard, IsInside{this, count});
+  }
+
+  int PeakInside() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return peak_inside_;
+  }
+  int WritesEntered() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return writes_entered_;
+  }
+  bool IsWriteDuringDescribe() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return is_write_during_describe_;
+  }
+
+  const domain::ICatalog& Catalog() const override { return catalog_; }
+
+  domain::ExecutionResult Execute(const domain::PlanNode&) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (inside_ > 0) {
+      is_write_during_describe_ = true;
+    }
+    ++writes_entered_;
+    return domain::AffectedRows{1};
+  }
+
+  domain::IndexDescriptionResult DescribeIndex(
+      const std::string& table) override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    ++inside_;
+    peak_inside_ = std::max(peak_inside_, inside_);
+    changed_.notify_all();
+    changed_.wait_for(lock, kHangGuard, CanLeave{this});
+    --inside_;
+    changed_.notify_all();
+    domain::IndexDescription description;
+    description.table = table;
+    description.column = "id";
+    description.height = 1;
+    description.node_count = 1;
+    description.key_count = 0;
+    description.check = "ok";
+    return description;
+  }
+
+ private:
+  struct IsInside {
+    const InspectorEngine* engine;
+    int count;
+    bool operator()() const { return engine->inside_ >= count; }
+  };
+  struct CanLeave {
+    const InspectorEngine* engine;
+    bool operator()() const {
+      return engine->inside_ >= engine->target_ && !engine->is_held_;
+    }
+  };
+
+  mutable std::mutex mutex_;
+  std::condition_variable changed_;
+  testing::FakeCatalog catalog_;
+  int target_ = 1;
+  bool is_held_ = false;
+  int inside_ = 0;
+  int peak_inside_ = 0;
+  int writes_entered_ = 0;
+  bool is_write_during_describe_ = false;
+};
+
+void RunDescribeIndex(QueryService* service,
+                      domain::IndexDescriptionResult* out) {
+  *out = service->DescribeIndex("visitors");
+}
+
+void RunExecute(QueryService* service, const domain::Statement* statement,
+                domain::ExecutionResult* out) {
+  *out = service->Execute(*statement);
+}
+
+bool IsDescription(const domain::IndexDescriptionResult& result) {
+  return std::holds_alternative<domain::IndexDescription>(result);
+}
+
+}  // namespace
+
+TEST(test_query_service_describe_index_takes_the_shared_lock) {
+  auto owned = std::make_unique<InspectorEngine>();
+  InspectorEngine* engine = owned.get();
+  QueryService service(std::move(owned), nullptr, engine);
+
+  // Two DescribeIndex calls wait inside until both are inside, so they can only
+  // finish when the lock lets them in together.
+  engine->Expect(2, false);
+  domain::IndexDescriptionResult first;
+  domain::IndexDescriptionResult second;
+  std::thread first_thread(RunDescribeIndex, &service, &first);
+  std::thread second_thread(RunDescribeIndex, &service, &second);
+  first_thread.join();
+  second_thread.join();
+  CHECK_EQ(engine->PeakInside(), 2);
+  CHECK(IsDescription(first) && IsDescription(second));
+
+  // A writer statement waits outside while a DescribeIndex call is inside.
+  engine->Expect(1, true);
+  domain::IndexDescriptionResult held;
+  std::thread reader_thread(RunDescribeIndex, &service, &held);
+  CHECK(engine->WaitUntilInside(1));
+  const domain::Statement insert =
+      testing::MustParse("INSERT INTO visitors VALUES (9, 'zed', 'Oslo')");
+  domain::ExecutionResult written = domain::AffectedRows{0};
+  std::thread writer_thread(RunExecute, &service, &insert, &written);
+  std::this_thread::sleep_for(kQuietWindow);
+  CHECK_EQ(engine->WritesEntered(), 0);
+  engine->Release();
+  reader_thread.join();
+  writer_thread.join();
+  CHECK_EQ(engine->WritesEntered(), 1);
+  CHECK(!engine->IsWriteDuringDescribe());
+  CHECK(IsDescription(held));
+
+  // A service whose engine has no inspector.
+  QueryService bare(std::make_unique<InspectorEngine>());
+  const domain::IndexDescriptionResult unsupported =
+      bare.DescribeIndex("visitors");
+  const auto* error = std::get_if<domain::ExecutionError>(&unsupported);
+  CHECK(error != nullptr);
+  if (error != nullptr) {
+    CHECK(error->kind == domain::ErrorKind::kUnsupported);
+    CHECK_EQ(error->message, std::string("the flatfile engine has no indexes"));
+  }
+}

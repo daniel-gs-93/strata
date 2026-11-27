@@ -12,10 +12,6 @@ namespace strata::paged {
 
 namespace {
 
-// Pages 0 to 2 are the file header and the first pages of the two system
-// tables; no user chain contains them.
-constexpr PageId kFirstUserPage = 3;
-
 PageError Corrupt(const std::string& detail) {
   return MakeError(PageErrorCode::kCorrupt, detail);
 }
@@ -129,6 +125,74 @@ Status PageAllocator::Release(PageId first_page) {
   }
   PageGuard header_guard = std::move(header).value();
   WriteLe32(header_guard.mutable_data() + layout::kFreeListHead, first_page);
+  header_guard.MarkDirty();
+  return std::nullopt;
+}
+
+Status PageAllocator::ReleasePages(const std::vector<PageId>& pages) {
+  if (pages.empty()) {
+    return std::nullopt;
+  }
+  // The whole list is checked before any page changes, so a refused list
+  // leaves the file as it was. Each page is latched shared, alone, and the
+  // guard ends with the iteration.
+  const PageId page_count = buffer_.PageCount();
+  std::unordered_set<PageId> listed;
+  for (PageId page_id : pages) {
+    if (page_id < kFirstUserPage) {
+      return MakeError(PageErrorCode::kInvalidArgument,
+                       "page " + std::to_string(page_id) +
+                           " belongs to the file header or a system table");
+    }
+    if (page_id >= page_count) {
+      return Corrupt("the page list leads past the end of the file: page " +
+                     std::to_string(page_id) + " of " +
+                     std::to_string(page_count));
+    }
+    if (!listed.insert(page_id).second) {
+      return Corrupt("the page list holds page " + std::to_string(page_id) +
+                     " twice");
+    }
+    PageResult<PageGuard> fetched =
+        buffer_.FetchPage(page_id, LatchMode::kShared);
+    if (!fetched.ok()) {
+      return fetched.error();
+    }
+    const PageType page_type =
+        SlottedPageView(fetched.value().data()).page_type();
+    if (page_type != PageType::kHeapData && page_type != PageType::kIndexNode) {
+      return Corrupt("page " + std::to_string(page_id) +
+                     " is in a page list but has page_type " +
+                     std::to_string(static_cast<int>(page_type)) +
+                     " instead of 2 or 4");
+    }
+  }
+  PageId link_after_list = kInvalidPageId;
+  {
+    PageResult<PageGuard> header = buffer_.FetchPage(0, LatchMode::kShared);
+    if (!header.ok()) {
+      return header.error();
+    }
+    link_after_list = ListLinkOf(HeadOf(header.value()));
+  }
+  for (std::size_t position = 0; position < pages.size(); ++position) {
+    PageResult<PageGuard> fetched =
+        buffer_.FetchPage(pages[position], LatchMode::kExclusive);
+    if (!fetched.ok()) {
+      return fetched.error();
+    }
+    PageGuard page = std::move(fetched).value();
+    const PageId next =
+        position + 1 < pages.size() ? pages[position + 1] : link_after_list;
+    SlottedPage::FormatFree(page.mutable_data(), pages[position], next);
+    page.MarkDirty();
+  }
+  PageResult<PageGuard> header = buffer_.FetchPage(0, LatchMode::kExclusive);
+  if (!header.ok()) {
+    return header.error();
+  }
+  PageGuard header_guard = std::move(header).value();
+  WriteLe32(header_guard.mutable_data() + layout::kFreeListHead, pages.front());
   header_guard.MarkDirty();
   return std::nullopt;
 }

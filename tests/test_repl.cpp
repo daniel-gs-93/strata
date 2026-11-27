@@ -1,8 +1,16 @@
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <ios>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#include "strata/paged/btree_node.h"
+#include "strata/paged/paged_types.h"
+#include "strata/paged/slotted_page.h"
 #include "strata/repl.h"
 #include "strata/sql_parser.h"
 #include "test_support.h"
@@ -304,7 +312,7 @@ TEST(test_repl_help_lists_commands_and_quit_stops_reading) {
 
   CHECK(!quit_first.empty());
   for (const char* marker :
-       {".open", ".engine", ".import", ".tables", ".schema", ".clear",
+       {".open", ".engine", ".import", ".tables", ".schema", ".dump", ".clear",
         ".cancel", ".help", ".quit"}) {
     CHECK_EQ(CountLinesStartingWith(quit_first, marker), 1);
   }
@@ -595,4 +603,240 @@ TEST(test_repl_initial_open_acts_like_dot_open) {
                               ": no such directory",
                           kNoDatabaseLine}));
   CHECK_EQ(created, Lines({"created new database " + fresh}));
+}
+
+// ----------------------------------------------------------------------------
+// `.dump index`.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+namespace paged = strata::paged;
+
+const char* const kUsageDumpIndex =
+    "syntax error at column 1: usage: .dump index <table>";
+
+// The first table of a new paged database has its heap at kFirstUserPage and
+// its index root on the next page.
+constexpr paged::PageId kFirstIndexRoot = paged::kFirstUserPage + 1;
+
+std::filesystem::path PagedFile(const std::filesystem::path& directory) {
+  return directory / "paged.db";
+}
+
+std::vector<std::uint8_t> ReadPageFromFile(const std::filesystem::path& file,
+                                           paged::PageId page_id) {
+  std::vector<std::uint8_t> bytes(paged::kPageSize);
+  std::ifstream stream(file, std::ios::binary);
+  stream.seekg(static_cast<std::streamoff>(page_id) * paged::kPageSize);
+  stream.read(reinterpret_cast<char*>(bytes.data()),
+              static_cast<std::streamsize>(bytes.size()));
+  return bytes;
+}
+
+// Overwrites one page of the file with the given bytes and nothing else.
+void WritePageToFile(const std::filesystem::path& file, paged::PageId page_id,
+                     const std::vector<std::uint8_t>& bytes) {
+  std::fstream stream(file, std::ios::in | std::ios::out | std::ios::binary);
+  stream.seekp(static_cast<std::streamoff>(page_id) * paged::kPageSize);
+  stream.write(reinterpret_cast<const char*>(bytes.data()),
+               static_cast<std::streamsize>(bytes.size()));
+}
+
+void WriteText(const std::filesystem::path& file, const std::string& text) {
+  std::ofstream stream(file, std::ios::binary);
+  stream << text;
+}
+
+// The index of the first line that starts with `prefix`, or lines.size().
+std::size_t IndexOfLineStartingWith(const Lines& lines,
+                                    const std::string& prefix) {
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (lines[i].starts_with(prefix)) {
+      return i;
+    }
+  }
+  return lines.size();
+}
+
+}  // namespace
+
+TEST(test_repl_dump_index_prints_shape_and_check) {
+  // The example of the design: three keys fit in the root, which is a leaf.
+  {
+    testing::TempDir directory;
+    const Lines output =
+        Run({".engine paged", OpenLine(directory.path()),
+             "CREATE TABLE notes (id INTEGER PRIMARY KEY AUTOINCREMENT, body "
+             "TEXT);",
+             "INSERT INTO notes (body) VALUES ('a'), ('b'), ('c');",
+             ".dump index notes"});
+    CHECK_EQ(Lines(output.end() - 3, output.end()),
+             Lines({"index notes(id): height 1, nodes 1, keys 3",
+                    "level 0 page 4 keys 3 [1 .. 3]", "check: ok"}));
+  }
+
+  // 6000 keys in ascending order: the root and 41 leaves, of which 40 nodes
+  // are listed.
+  {
+    testing::TempDir directory;
+    Lines input = {".engine paged", OpenLine(directory.path()),
+                   "CREATE TABLE big (id INT PRIMARY KEY, v INT);"};
+    for (int first = 1; first <= 6000; first += 500) {
+      std::string insert = "INSERT INTO big VALUES ";
+      for (int id = first; id < first + 500; ++id) {
+        insert += (id > first ? ", (" : "(") + std::to_string(id) + ", 0)";
+      }
+      input.push_back(insert + ";");
+    }
+    input.push_back(".dump index big");
+    const Lines output = Run(input);
+    const std::size_t first_line =
+        IndexOfLineStartingWith(output, "index big(id)");
+    CHECK_EQ(output.size(), first_line + 43);
+    if (output.size() == first_line + 43) {
+      CHECK_EQ(output[first_line],
+               std::string("index big(id): height 2, nodes 42, keys 6000"));
+      CHECK(output[first_line + 1].starts_with("level 1 page "));
+      CHECK(output[first_line + 1].find(" next ") == std::string::npos);
+      for (std::size_t i = first_line + 2; i <= first_line + 40; ++i) {
+        CHECK(output[i].starts_with("level 0 page "));
+        CHECK(output[i].find(" keys 145 [") != std::string::npos);
+        CHECK(output[i].find(" next ") != std::string::npos);
+      }
+      CHECK_EQ(output[first_line + 41], std::string("... and 2 more nodes"));
+      CHECK_EQ(output[first_line + 42], std::string("check: ok"));
+    }
+  }
+
+  // A leaf that lost an entry: the check line carries the violation.
+  {
+    testing::TempDir directory;
+    CHECK(!Run({".engine paged", OpenLine(directory.path()),
+                "CREATE TABLE gems (id INT PRIMARY KEY, v INT);",
+                "INSERT INTO gems VALUES (1, 1), (2, 2), (3, 3);"})
+               .empty());
+    std::vector<std::uint8_t> root =
+        ReadPageFromFile(PagedFile(directory.path()), kFirstIndexRoot);
+    paged::LeafRemoveAt(root.data(), 0);
+    paged::SlottedPage::SealChecksum(root.data());
+    WritePageToFile(PagedFile(directory.path()), kFirstIndexRoot, root);
+
+    const Lines output =
+        Run({".engine paged", OpenLine(directory.path()), ".dump index gems"});
+    CHECK_EQ(output.size(), std::size_t{5});
+    if (output.size() == 5) {
+      CHECK_EQ(output[2],
+               std::string("index gems(id): height 1, nodes 1, keys 2"));
+      CHECK_EQ(output[3], std::string("level 0 page 4 keys 2 [2 .. 3]"));
+      CHECK(output[4].starts_with("check: "));
+      CHECK(output[4].find("has no entry for key 1") != std::string::npos);
+    }
+  }
+}
+
+TEST(test_repl_dump_index_reports_errors_and_empty_trees) {
+  testing::TempDir directory;
+  const Lines paged_output =
+      Run({".dump index t", ".engine paged", OpenLine(directory.path()),
+           "CREATE TABLE words (code TEXT PRIMARY KEY, n INT);",
+           "CREATE TABLE emptied (id INT PRIMARY KEY, v INT);",
+           "INSERT INTO emptied VALUES (1, 1), (2, 2);", "DELETE FROM emptied;",
+           ".dump index words", ".dump index nosuch", ".dump index emptied",
+           ".dump", ".dump index", ".dump tables x", ".dump index a b"});
+  CHECK_EQ(paged_output.front(), std::string(kNoDatabaseLine));
+  CHECK(paged_output.size() > std::size_t{9});
+  if (paged_output.size() <= 9) {
+    return;
+  }
+  const Lines tail(paged_output.end() - 9, paged_output.end());
+  CHECK_EQ(Lines(tail.begin(), tail.begin() + 3),
+           Lines({"error: bind: table words has no index",
+                  "error: no such table: nosuch",
+                  "index emptied(id): height 1, nodes 1, keys 0"}));
+  // An emptied tree keeps its root: one node line, without a bracket.
+  CHECK(tail[3].starts_with("level 0 page "));
+  CHECK(tail[3].ends_with(" keys 0"));
+  CHECK_EQ(tail[4], std::string("check: ok"));
+  CHECK_EQ(Lines(tail.begin() + 5, tail.end()),
+           Lines(4, std::string(kUsageDumpIndex)));
+
+  // The flatfile engine has no indexes, whatever the table.
+  testing::TempDir flat_directory;
+  const Lines flat_output = Run({OpenLine(flat_directory.path()),
+                                 "CREATE TABLE t (id INT PRIMARY KEY);",
+                                 ".dump index t", ".dump index nosuch"});
+  CHECK_EQ(Lines(flat_output.end() - 2, flat_output.end()),
+           Lines({"error: unsupported: the flatfile engine has no indexes",
+                  "error: no such table: nosuch"}));
+}
+
+TEST(test_paged_engine_index_follows_primary_key_type_and_survives_reopen) {
+  testing::TempDir directory;
+  testing::TempDir sources;
+  WriteText(sources.path() / "ids.csv", "id,name\n1,a\n2,b\n3,c\n");
+  WriteText(sources.path() / "words.csv", "code,n\nalpha,1\nbeta,2\n");
+  const std::string ids_path = (sources.path() / "ids.csv").string();
+  const std::string words_path = (sources.path() / "words.csv").string();
+  const Lines queries = {".dump index made",
+                         ".dump index ids",
+                         ".dump index words",
+                         "SELECT v FROM made WHERE id = 7;",
+                         "SELECT name FROM ids WHERE id = 2;",
+                         "SELECT n FROM words WHERE code = 'beta';"};
+  Lines first_session = {".engine paged",
+                         OpenLine(directory.path()),
+                         "CREATE TABLE made (id INT PRIMARY KEY, v INT);",
+                         "INSERT INTO made VALUES (7, 70), (8, 80);",
+                         ".import " + ids_path + " ids --pk id --type id=INT",
+                         ".import " + words_path + " words --pk code"};
+  first_session.insert(first_session.end(), queries.begin(), queries.end());
+  Lines second_session = {".engine paged", OpenLine(directory.path())};
+  second_session.insert(second_session.end(), queries.begin(), queries.end());
+  const Lines first_output = Run(first_session);
+  const Lines second_output = Run(second_session);
+
+  // The queries print 13 lines: two index dumps of 3, the error of the TEXT
+  // key, and three 2-line results.
+  constexpr std::size_t kQueryLines = 13;
+  CHECK(first_output.size() > kQueryLines);
+  CHECK(second_output.size() > kQueryLines);
+  if (first_output.size() <= kQueryLines ||
+      second_output.size() <= kQueryLines) {
+    return;
+  }
+  const Lines before(first_output.end() - kQueryLines, first_output.end());
+  const Lines after(second_output.end() - kQueryLines, second_output.end());
+  CHECK_EQ(before, after);
+  CHECK_EQ(before[0], std::string("index made(id): height 1, nodes 1, keys 2"));
+  CHECK(before[1].starts_with("level 0 page "));
+  CHECK_EQ(before[2], std::string("check: ok"));
+  CHECK_EQ(before[3], std::string("index ids(id): height 1, nodes 1, keys 3"));
+  CHECK(before[4].starts_with("level 0 page "));
+  CHECK_EQ(Lines(before.begin() + 5, before.end()),
+           Lines({"check: ok", "error: bind: table words has no index", "v",
+                  "70", "name", "b", "n", "2"}));
+
+  // The root of `made` rewritten to the first page of its heap: opening the
+  // directory fails and the open database stays.
+  WritePageToFile(
+      PagedFile(directory.path()), kFirstIndexRoot,
+      ReadPageFromFile(PagedFile(directory.path()), paged::kFirstUserPage));
+  testing::TempDir healthy;
+  const Lines damaged_output = Run({".engine paged", OpenLine(healthy.path()),
+                                    "CREATE TABLE fine (id INT PRIMARY KEY);",
+                                    OpenLine(directory.path()), ".tables"});
+  CHECK(damaged_output.size() > std::size_t{2});
+  if (damaged_output.size() > 2) {
+    const std::string& failure = damaged_output[damaged_output.size() - 2];
+    CHECK(failure.starts_with("error: could not open " +
+                              directory.path().string() + ": corrupt: "));
+    CHECK_EQ(damaged_output.back(), std::string("fine"));
+  }
+
+  // The flatfile engine does not read paged.db.
+  const Lines flat_output = Run({OpenLine(directory.path())});
+  for (const std::string& line : flat_output) {
+    CHECK(!line.starts_with("error"));
+  }
 }

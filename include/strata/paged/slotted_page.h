@@ -73,8 +73,9 @@ class SlottedPage {
   static void SealChecksum(std::uint8_t* page);
 
   // The checks made after a page is read (any page type): checksum, page_id
-  // equal to expected_page_id, page_type in 0..3, and for heap data and free
-  // pages free_start <= free_end <= 4096. An all-zero page passes as
+  // equal to expected_page_id, page_type in 0..4, for heap data and free
+  // pages free_start <= free_end <= 4096, and for an index node slot_count,
+  // free_end and dead_bytes equal to 0. An all-zero page passes as
   // unformatted. kCorrupt messages name expected_page_id and the violation.
   // O(kPageSize).
   static Status VerifyHeader(const std::uint8_t* page, PageId expected_page_id);

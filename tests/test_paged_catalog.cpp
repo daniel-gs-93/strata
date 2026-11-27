@@ -287,9 +287,11 @@ TEST(test_paged_catalog_create_table_undoes_partial_rows) {
 
   const std::size_t tables_before = SystemRowCount(database, 1);
   const std::size_t columns_before = SystemRowCount(database, 2);
-  // The first allocation is wide_b's first page; the second is a new page of
-  // sys_columns, which the 100 column rows of wide_b need.
-  env.store->InjectFailure(Operation::kAllocate, 2);
+  // The first allocation is wide_b's first page, the second the root of its
+  // index, and the third a new page of sys_columns, which the 100 column rows
+  // of wide_b need. The sys_tables row of wide_b exists by then, so the failure
+  // has a row to undo.
+  env.store->InjectFailure(Operation::kAllocate, 3);
   CHECK_ERROR(database.CreateTable(second), kIo);
   CHECK_EQ(SystemRowCount(database, 1), tables_before);
   CHECK_EQ(SystemRowCount(database, 2), columns_before);
@@ -408,14 +410,15 @@ std::string LoadAfterDamage(SystemDamage damage) {
     case SystemDamage::kNone:
       break;
     case SystemDamage::kDuplicateTableId:
-      CHECK_OK(sys_tables.Insert(Row{
-          Value(std::int64_t{3}), Value(std::string("other")),
-          table_row->row[2], Value(std::int64_t{0}), Value(std::int64_t{-1})}));
+      CHECK_OK(sys_tables.Insert(
+          Row{Value(std::int64_t{3}), Value(std::string("other")),
+              table_row->row[2], Value(std::int64_t{0}),
+              Value(std::int64_t{-1}), table_row->row[5]}));
       break;
     case SystemDamage::kDuplicateName:
       CHECK_OK(sys_tables.Insert(Row{
           Value(std::int64_t{5}), Value(std::string("t")), table_row->row[2],
-          Value(std::int64_t{0}), Value(std::int64_t{-1})}));
+          Value(std::int64_t{0}), Value(std::int64_t{-1}), table_row->row[5]}));
       break;
     case SystemDamage::kFirstPageOutsideFile:
       SetIntColumn(sys_tables, *table_row, 2,
@@ -572,7 +575,9 @@ TEST(test_paged_catalog_adds_columns_and_reloads_them) {
     if (!extended.ok() || !new_first.ok()) {
       return;
     }
-    CHECK_OK(catalog.CommitAddColumn("T", column, new_first.value()));
+    // This test changes the catalog only, so the index root stays as it is.
+    CHECK_OK(catalog.CommitAddColumn("T", column, new_first.value(),
+                                     catalog.IndexRoot("T").value_or(0)));
     last_first_page = new_first.value();
     const auto found = catalog.FindTable("t");
     CHECK(found.has_value());
@@ -616,8 +621,10 @@ TEST(test_paged_catalog_adds_columns_and_reloads_them) {
 
 TEST(test_paged_catalog_add_column_failure_leaves_the_old_schema) {
   // A closed database with one table, read back through a cold pool.
+  const ColumnDef column{"extra", DataType::kInt, Value(std::int64_t{1})};
   std::unique_ptr<MemoryPageStore> base;
   PageId table_page = 0;
+  PageId index_root = 0;
   {
     OpenedDatabase env = OpenMemoryDatabase();
     if (env.database == nullptr) {
@@ -625,11 +632,34 @@ TEST(test_paged_catalog_add_column_failure_leaves_the_old_schema) {
     }
     CHECK_OK(env.database->CreateTable(BasicSchema("T")));
     table_page = *env.database->catalog().FirstPage("T");
+    index_root = env.database->catalog().IndexRoot("T").value_or(0);
+    // Tables are added until the sys_columns row of one more column needs a new
+    // page there, which a probe on a copy shows by the growth of the store. The
+    // allocation of that page is the step that the sweep below fails: a read
+    // never fails here, because every page that the call touches is in the
+    // pool.
+    bool does_add_allocate = false;
+    for (int filler = 0; filler < 200 && !does_add_allocate; ++filler) {
+      CHECK_OK(env.database->buffer().FlushAll());
+      auto probe = strata::testing::OpenCopy(*env.store, 16);
+      if (probe.database == nullptr) {
+        return;
+      }
+      const PageId pages_before = probe.store->PageCount();
+      CHECK_OK(probe.database->catalog().CommitAddColumn(
+          "T", column, table_page, index_root));
+      does_add_allocate = probe.store->PageCount() > pages_before;
+      if (!does_add_allocate) {
+        CHECK_OK(env.database->CreateTable(
+            BasicSchema("F" + std::to_string(filler))));
+      }
+    }
+    CHECK(does_add_allocate);
     CHECK_OK(env.database->Close());
     base = strata::testing::CopyOfStore(*env.store);
   }
-  const ColumnDef column{"extra", DataType::kInt, Value(std::int64_t{1})};
   bool has_succeeded = false;
+  int failures_seen = 0;
   for (int nth_call = 1; nth_call < 100 && !has_succeeded; ++nth_call) {
     auto opened = strata::testing::OpenCopy(*base, 4);
     if (opened.database == nullptr) {
@@ -637,15 +667,16 @@ TEST(test_paged_catalog_add_column_failure_leaves_the_old_schema) {
     }
     Database& database = *opened.database;
     const std::optional<TableSchema> before = database.catalog().FindTable("T");
-    opened.store->InjectFailure(Operation::kRead, nth_call);
+    opened.store->InjectFailure(Operation::kAllocate, nth_call);
     const auto status =
-        database.catalog().CommitAddColumn("T", column, table_page);
+        database.catalog().CommitAddColumn("T", column, table_page, index_root);
     opened.store->ClearInjectedFailures();
     if (!status.has_value()) {
       has_succeeded = true;
       continue;
     }
     CHECK_ERROR(status, kIo);
+    ++failures_seen;
     const std::optional<TableSchema> after = database.catalog().FindTable("T");
     CHECK(before.has_value() && after.has_value());
     if (before.has_value() && after.has_value()) {
@@ -668,6 +699,8 @@ TEST(test_paged_catalog_add_column_failure_leaves_the_old_schema) {
     }
   }
   CHECK(has_succeeded);
+  // The sweep reached a failure, so the checks above ran at least once.
+  CHECK(failures_seen > 0);
 }
 
 TEST(test_paged_catalog_drops_a_table_and_never_reuses_its_id) {
@@ -709,4 +742,131 @@ TEST(test_paged_catalog_drops_a_table_and_never_reuses_its_id) {
   Catalog after(database.buffer(), database.allocator(), 1, 2);
   CHECK_OK(after.Load());
   CHECK_EQ(after.TableNames(), (std::vector<std::string>{"c", "d"}));
+}
+
+namespace {
+
+// A database with the table "t" (INT key, table id 3, pages 3 and 4) and the
+// table "k" (TEXT key, table id 4, page 5), whose sys_tables row of table_id
+// gets index_root = new_root. It is closed and opened again over a copy of the
+// store, so that Catalog::Load meets the change.
+strata::testing::OpenedCopy OpenAfterRootRewrite(std::int64_t table_id,
+                                                 std::int64_t new_root) {
+  OpenedDatabase env = OpenMemoryDatabase();
+  strata::testing::OpenedCopy none;
+  if (env.database == nullptr) {
+    return none;
+  }
+  Database& database = *env.database;
+  CHECK_OK(database.CreateTable(BasicSchema("t")));
+  TableSchema text_key;
+  text_key.name = "k";
+  text_key.columns = {{"code", DataType::kText}, {"v", DataType::kInt}};
+  text_key.primary_key_index = 0;
+  CHECK_OK(database.CreateTable(text_key));
+  auto tables = TableHeap::Open(database.buffer(), database.allocator(),
+                                Catalog::SysTablesSchema(), 1, 1);
+  CHECK_OK(tables);
+  if (!tables.ok()) {
+    return none;
+  }
+  const auto row = FindSystemRow(tables.value(), 0, table_id);
+  CHECK(row.has_value());
+  if (!row.has_value()) {
+    return none;
+  }
+  SetIntColumn(tables.value(), *row, 5, new_root);
+  CHECK_OK(database.Close());
+  return strata::testing::OpenCopy(*env.store);
+}
+
+}  // namespace
+
+TEST(test_paged_catalog_records_the_index_root) {
+  OpenedDatabase env = OpenMemoryDatabase();
+  if (env.database == nullptr) {
+    return;
+  }
+  Database& database = *env.database;
+  CHECK_OK(database.CreateTable(BasicSchema("t")));
+  TableSchema text_key;
+  text_key.name = "k";
+  text_key.columns = {{"code", DataType::kText}, {"v", DataType::kInt}};
+  text_key.primary_key_index = 0;
+  CHECK_OK(database.CreateTable(text_key));
+
+  // The INT table has its first page 3 and its root 4, the TEXT table only a
+  // first page, and no page more.
+  CHECK(database.catalog().FirstPage("t") == std::optional<PageId>(3));
+  CHECK(database.catalog().IndexRoot("t") == std::optional<PageId>(4));
+  CHECK(database.catalog().FirstPage("k") == std::optional<PageId>(5));
+  CHECK(!database.catalog().IndexRoot("k").has_value());
+  CHECK_EQ(database.buffer().PageCount(), PageId{6});
+  auto tables = TableHeap::Open(database.buffer(), database.allocator(),
+                                Catalog::SysTablesSchema(), 1, 1);
+  CHECK_OK(tables);
+  if (!tables.ok()) {
+    return;
+  }
+  const auto int_row = FindSystemRow(tables.value(), 0, 3);
+  const auto text_row = FindSystemRow(tables.value(), 0, 4);
+  CHECK(int_row.has_value() && text_row.has_value());
+  if (int_row.has_value() && text_row.has_value()) {
+    CHECK_EQ(int_row->row.size(), std::size_t{6});
+    CHECK_EQ(std::get<std::int64_t>(int_row->row[2]), std::int64_t{3});
+    CHECK_EQ(std::get<std::int64_t>(int_row->row[5]), std::int64_t{4});
+    CHECK_EQ(std::get<std::int64_t>(text_row->row[5]), std::int64_t{0});
+  }
+  // The root is an empty leaf of its table.
+  {
+    auto fetched = database.buffer().FetchPage(4, LatchMode::kShared);
+    CHECK_OK(fetched);
+    if (fetched.ok()) {
+      const strata::paged::NodeView node(fetched.value().data());
+      CHECK_EQ(node.table_id(), std::uint32_t{3});
+      CHECK_EQ(node.level(), std::uint16_t{0});
+      CHECK_EQ(node.key_count(), std::uint16_t{0});
+      CHECK_EQ(node.next_page_id(), strata::paged::kInvalidPageId);
+    }
+  }
+  // After a reopen the catalog agrees.
+  CHECK_OK(database.Close());
+  auto reopened = strata::testing::OpenCopy(*env.store);
+  CHECK(reopened.database != nullptr);
+  if (reopened.database != nullptr) {
+    CHECK(reopened.database->catalog().IndexRoot("t") ==
+          std::optional<PageId>(4));
+    CHECK(!reopened.database->catalog().IndexRoot("k").has_value());
+  }
+
+  // A root that the load rules refuse: a TEXT key with a root, an INT key
+  // without one, a root of 2, a root past the end of the file. Each is kCorrupt
+  // and names the table.
+  struct Rewrite {
+    std::int64_t table_id;
+    std::int64_t new_root;
+    const char* table_name;
+  };
+  const Rewrite rewrites[] = {{4, 4, "table k"},
+                              {3, 0, "table t"},
+                              {3, 2, "table t"},
+                              {3, 100, "table t"}};
+  for (const Rewrite& rewrite : rewrites) {
+    auto opened = OpenAfterRootRewrite(rewrite.table_id, rewrite.new_root);
+    CHECK(opened.database == nullptr);
+    CHECK_ERROR(strata::paged::Status(opened.error), kCorrupt);
+    CHECK_MESSAGE_CONTAINS(strata::paged::Status(opened.error),
+                           rewrite.table_name);
+  }
+  // A root that is a heap page passes the load and fails when the index is
+  // opened.
+  auto heap_root = OpenAfterRootRewrite(3, 5);
+  CHECK(heap_root.database != nullptr);
+  if (heap_root.database != nullptr) {
+    const auto index = heap_root.database->Index("t");
+    CHECK_ERROR(index, kCorrupt);
+    CHECK_MESSAGE_CONTAINS(index,
+                           "index of t: page 5: index node has page_type 2");
+    CHECK_EQ(heap_root.database->buffer().PinnedFrameCount(), std::size_t{0});
+  }
 }

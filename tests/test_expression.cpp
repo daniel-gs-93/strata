@@ -316,6 +316,18 @@ TEST(test_expression_concat_joins_text) {
   CHECK(IsText(EvaluateBinary(Op::kConcat, Text(""), Text("")).value, ""));
   CHECK(IsText(EvaluateBinary(Op::kConcat, Text("é"), Text("€")).value, "é€"));
   CHECK(IsText(EvaluateBinary(Op::kConcat, Text("x"), Text("")).value, "x"));
+
+  // A result of exactly 16777216 bytes is allowed; one byte more is refused, so
+  // a chain of concatenations cannot multiply a long value without bound.
+  const std::string half(8388608, 'a');
+  const std::string failure_message =
+      "result of || is longer than 16777216 bytes";
+  const auto at_the_limit = EvaluateBinary(Op::kConcat, Text(half), Text(half));
+  CHECK(at_the_limit.value.has_value());
+  CHECK(FailedWith(EvaluateBinary(Op::kConcat, Text(half), Text(half + "b")),
+                   failure_message));
+  CHECK(FailedWith(EvaluateBinary(Op::kConcat, Text(half + "b"), Text(half)),
+                   failure_message));
 }
 
 TEST(test_like_matches_wildcards_case_and_utf8) {

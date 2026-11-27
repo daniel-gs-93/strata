@@ -4,13 +4,18 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "strata/domain/index_inspector.h"
 #include "strata/domain/value.h"
+#include "strata/paged/btree_node.h"
 #include "strata/paged/buffer_manager.h"
 #include "strata/paged/byte_codec.h"
 #include "strata/paged/database.h"
+#include "strata/paged/heap_access.h"
 #include "strata/paged/page_store.h"
+#include "strata/paged/paged_engine.h"
 #include "strata/paged/slotted_page.h"
 #include "test_harness.h"
 #include "test_paged_ddl_support.h"
@@ -35,6 +40,7 @@ using strata::testing::BodyRow;
 using strata::testing::BodySchema;
 using strata::testing::ChainOf;
 using strata::testing::EveryPageIsAccountedFor;
+using strata::testing::IndexPagesOf;
 using strata::testing::MemoryDatabase;
 using strata::testing::OpenCopy;
 using strata::testing::OpenNewMemoryDatabase;
@@ -206,6 +212,10 @@ TEST(test_paged_ddl_add_column_rewrites_rows_and_survives_reopen) {
   for (const ColumnDef& column : columns) {
     const PageId old_first = *database.catalog().FirstPage("T");
     const std::vector<PageId> old_chain = ChainOf(database.buffer(), old_first);
+    // The pages of the old tree go on the free list after the old chain, so
+    // they come first in the list.
+    std::vector<PageId> old_pages = IndexPagesOf(database, "t");
+    old_pages.insert(old_pages.end(), old_chain.begin(), old_chain.end());
     auto altered = database.AddColumn(is_first ? "t" : "T", column);
     CHECK_OK(altered);
     if (!altered.ok()) {
@@ -226,7 +236,7 @@ TEST(test_paged_ddl_add_column_rewrites_rows_and_survives_reopen) {
     CHECK(database.catalog().TableId("t") == table_id);
     CHECK(EveryPageIsAccountedFor(database));
     if (is_first) {
-      CHECK_EQ(FreePagesOf(database), old_chain);
+      CHECK_EQ(FreePagesOf(database), old_pages);
     }
     is_first = false;
   }
@@ -375,6 +385,10 @@ TEST(test_paged_ddl_drop_table_frees_pages_and_reuses_them) {
   FillTable(database, "c", 20, 2000);
   const std::vector<PageId> b_chain =
       ChainOf(database.buffer(), *database.catalog().FirstPage("b"));
+  // The pages of the index go on the free list after the chain, so they come
+  // first in the list.
+  std::vector<PageId> b_pages = IndexPagesOf(database, "b");
+  b_pages.insert(b_pages.end(), b_chain.begin(), b_chain.end());
   const std::vector<Row> a_rows = RowsOf(database, "a");
   const std::vector<Row> c_rows = RowsOf(database, "c");
   const PageId page_count = database.buffer().PageCount();
@@ -386,7 +400,7 @@ TEST(test_paged_ddl_drop_table_frees_pages_and_reuses_them) {
            (std::vector<std::string>{"a", "c"}));
   CHECK(RowsOf(database, "a") == a_rows);
   CHECK(RowsOf(database, "c") == c_rows);
-  CHECK_EQ(FreePagesOf(database), b_chain);
+  CHECK_EQ(FreePagesOf(database), b_pages);
   CHECK(EveryPageIsAccountedFor(database));
 
   CHECK_OK(database.Close());
@@ -397,7 +411,7 @@ TEST(test_paged_ddl_drop_table_frees_pages_and_reuses_them) {
   }
   Database& second = *reopened.database;
   CHECK_ERROR(second.Table("b"), kNotFound);
-  CHECK_EQ(FreePagesOf(second), b_chain);
+  CHECK_EQ(FreePagesOf(second), b_pages);
 
   FillTable(second, "d", 20, 2000);
   CHECK(second.catalog().TableId("d").has_value());
@@ -618,4 +632,609 @@ TEST(test_paged_ddl_runs_with_four_frames) {
   CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
   CHECK_EQ(RowsOf(database, "u").size(), std::size_t{40});
   CHECK_EQ(database.buffer().PageCount(), page_count);
+}
+
+namespace {
+
+// A closed copy of a database with table "t" of `rows` rows whose heap and
+// index agree: 300-byte bodies, so about 12 rows to a page.
+std::unique_ptr<MemoryPageStore> IndexedBase(std::int64_t rows) {
+  MemoryDatabase env = OpenNewMemoryDatabase();
+  if (env.database == nullptr) {
+    return nullptr;
+  }
+  strata::testing::FillIndexedTable(*env.database, "t", rows, 300);
+  CHECK_OK(env.database->CheckIndex("t"));
+  CHECK_OK(env.database->Close());
+  return strata::testing::CopyOfStore(*env.store);
+}
+
+bool Contains(const std::vector<PageId>& pages, PageId page_id) {
+  return std::ranges::find(pages, page_id) != pages.end();
+}
+
+}  // namespace
+
+TEST(test_paged_ddl_add_column_rebuilds_the_index) {
+  const std::unique_ptr<MemoryPageStore> base = IndexedBase(700);
+  if (base == nullptr) {
+    return;
+  }
+  const ColumnDef column{"extra", DataType::kInt, Value(std::int64_t{5})};
+
+  // Without a failure: the new tree finds every row in the new chain.
+  {
+    auto opened = OpenCopy(*base, 16);
+    CHECK(opened.database != nullptr);
+    if (opened.database == nullptr) {
+      return;
+    }
+    Database& database = *opened.database;
+    const PageId old_root = database.catalog().IndexRoot("t").value_or(0);
+    const std::vector<PageId> old_pages = IndexPagesOf(database, "t");
+    CHECK(old_pages.size() >= 3);  // the root and at least two leaves
+    CHECK_OK(database.AddColumn("t", column));
+    CHECK_OK(database.CheckIndex("t"));
+    const PageId new_root = database.catalog().IndexRoot("t").value_or(0);
+    CHECK(new_root != 0 && new_root != old_root);
+    const std::vector<PageId> free_pages = FreePagesOf(database);
+    for (PageId page_id : old_pages) {
+      CHECK(Contains(free_pages, page_id));
+    }
+    CHECK(EveryPageIsAccountedFor(database));
+    CHECK_OK(database.Close());
+    auto reopened = OpenCopy(*opened.store, 16);
+    CHECK(reopened.database != nullptr);
+    if (reopened.database != nullptr) {
+      CHECK_OK(reopened.database->CheckIndex("t"));
+      CHECK_EQ(RowsOf(*reopened.database, "t").size(), std::size_t{700});
+    }
+  }
+
+  // With the n-th read, write and allocation failing, in a pool of 5 frames.
+  const Operation operations[] = {Operation::kRead, Operation::kWrite,
+                                  Operation::kAllocate};
+  for (const Operation operation : operations) {
+    bool has_succeeded = false;
+    int failures_seen = 0;
+    for (int nth_call = 1; nth_call < 400 && !has_succeeded; ++nth_call) {
+      auto opened = OpenCopy(*base, 5);
+      CHECK(opened.database != nullptr);
+      if (opened.database == nullptr) {
+        return;
+      }
+      Database& database = *opened.database;
+      opened.store->InjectFailure(operation, nth_call);
+      const auto altered = database.AddColumn("t", column);
+      opened.store->ClearInjectedFailures();
+      if (altered.ok()) {
+        has_succeeded = true;
+      } else {
+        CHECK_ERROR(altered, kIo);
+        ++failures_seen;
+      }
+      // The table is the old one with its old index, or the new one with its
+      // new index.
+      const auto schema = database.catalog().FindTable("t");
+      CHECK(schema.has_value());
+      if (schema.has_value()) {
+        const std::size_t column_count = schema->columns.size();
+        CHECK(column_count == 2 || column_count == 3);
+        if (altered.ok()) {
+          CHECK_EQ(column_count, std::size_t{3});
+        }
+      }
+      CHECK_OK(database.CheckIndex("t"));
+      CHECK_EQ(RowsOf(database, "t").size(), std::size_t{700});
+      CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+      // The one injected failure has fired, so the release of the pages of a
+      // failed attempt works, unless it is the step that failed: then the
+      // message says that releasing also failed or that pages were not
+      // reclaimed. Otherwise no page is left without an owner.
+      const bool is_release_failure =
+          !altered.ok() &&
+          (altered.error().message.find("also failed") != std::string::npos ||
+           altered.error().message.find("not reclaimed") != std::string::npos);
+      if (!is_release_failure) {
+        CHECK(EveryPageIsAccountedFor(database));
+      }
+      CHECK_OK(database.Close());
+      auto reopened = OpenCopy(*opened.store, 16);
+      CHECK(reopened.database != nullptr);
+      if (reopened.database != nullptr) {
+        CHECK_OK(reopened.database->CheckIndex("t"));
+      }
+    }
+    CHECK(has_succeeded);
+    CHECK(failures_seen > 0);
+  }
+}
+
+// A table whose primary key is TEXT has no index: ADD COLUMN builds only a new
+// chain, and DROP TABLE frees only the chain.
+TEST(test_paged_ddl_a_table_without_an_index_adds_a_column_and_drops) {
+  MemoryDatabase memory = OpenNewMemoryDatabase(16);
+  if (memory.database == nullptr) {
+    return;
+  }
+  Database& database = *memory.database;
+  TableSchema schema;
+  schema.name = "words";
+  schema.columns = {ColumnDef{"word", DataType::kText},
+                    ColumnDef{"count", DataType::kInt}};
+  schema.primary_key_index = 0;
+  CHECK_OK(database.CreateTable(schema));
+  CHECK(!database.catalog().IndexRoot("words").has_value());
+  auto heap = database.Table("words");
+  CHECK_OK(heap);
+  if (!heap.ok()) {
+    return;
+  }
+  constexpr std::int64_t kRowCount = 600;
+  for (std::int64_t number = 0; number < kRowCount; ++number) {
+    CHECK_OK(heap.value()->Insert(
+        Row{Value("word" + std::to_string(number) + std::string(40, 'x')),
+            Value(number)}));
+  }
+  CHECK(strata::testing::ChainOf(database.buffer(),
+                                 database.catalog().FirstPage("words").value())
+            .size() > 3);
+
+  CHECK_OK(database.AddColumn(
+      "words", ColumnDef{"extra", DataType::kInt, Value(std::int64_t{5})}));
+  CHECK(!database.catalog().IndexRoot("words").has_value());
+  const std::vector<Row> rows = RowsOf(database, "words");
+  CHECK_EQ(rows.size(), static_cast<std::size_t>(kRowCount));
+  for (const Row& row : rows) {
+    CHECK_EQ(row.size(), std::size_t{3});
+    if (row.size() == 3) {
+      CHECK(row[2] == Value(std::int64_t{5}));
+    }
+  }
+  CHECK_ERROR(database.CheckIndex("words"), kInvalidArgument);
+  CHECK(EveryPageIsAccountedFor(database));
+
+  CHECK_OK(database.DropTable("words"));
+  CHECK(database.catalog().TableNames().empty());
+  CHECK(EveryPageIsAccountedFor(database));
+  CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+}
+
+// An index entry whose row is gone: every row still has its entry, so only the
+// count of entries against the count of rows shows the damage.
+TEST(test_paged_ddl_check_index_counts_entries_that_have_no_row) {
+  MemoryDatabase memory = OpenNewMemoryDatabase(16);
+  if (memory.database == nullptr) {
+    return;
+  }
+  Database& database = *memory.database;
+  strata::testing::FillIndexedTable(database, "t", 50, 20);
+  CHECK_OK(database.CheckIndex("t"));
+  auto heap = database.Table("t");
+  CHECK_OK(heap);
+  if (!heap.ok()) {
+    return;
+  }
+  strata::paged::HeapScan scan = heap.value()->Scan();
+  auto first = scan.Next();
+  CHECK_OK(first);
+  if (!first.ok() || !first.value().has_value()) {
+    CHECK(false);
+    return;
+  }
+  CHECK_OK(heap.value()->Delete(first.value()->rid));
+
+  const auto status = database.CheckIndex("t");
+
+  CHECK_ERROR(status, kCorrupt);
+  CHECK_MESSAGE_CONTAINS(status, "has 50 entries for 49 rows");
+  CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+}
+
+TEST(test_paged_ddl_drop_table_frees_the_index_pages) {
+  const std::unique_ptr<MemoryPageStore> base = IndexedBase(700);
+  if (base == nullptr) {
+    return;
+  }
+  // Without a failure: the free list holds the pages of the tree and then the
+  // chain, and the table created again takes its first two pages from them.
+  {
+    auto opened = OpenCopy(*base, 16);
+    CHECK(opened.database != nullptr);
+    if (opened.database == nullptr) {
+      return;
+    }
+    Database& database = *opened.database;
+    std::vector<PageId> expected = IndexPagesOf(database, "t");
+    CHECK(expected.size() >= 3);
+    const std::vector<PageId> chain =
+        ChainOf(database.buffer(), *database.catalog().FirstPage("t"));
+    expected.insert(expected.end(), chain.begin(), chain.end());
+    const PageId page_count = database.buffer().PageCount();
+    CHECK_OK(database.DropTable("t"));
+    CHECK_EQ(FreePagesOf(database), expected);
+    CHECK(EveryPageIsAccountedFor(database));
+    CHECK_OK(database.CreateTable(BodySchema("t")));
+    CHECK_EQ(database.catalog().FirstPage("t").value_or(0), expected[0]);
+    CHECK_EQ(database.catalog().IndexRoot("t").value_or(0), expected[1]);
+    CHECK_EQ(database.buffer().PageCount(), page_count);
+  }
+
+  // With the n-th read, write and allocation failing, in a pool of 5 frames.
+  const Operation operations[] = {Operation::kRead, Operation::kWrite,
+                                  Operation::kAllocate};
+  for (const Operation operation : operations) {
+    bool has_succeeded = false;
+    int failures_seen = 0;
+    for (int nth_call = 1; nth_call < 400 && !has_succeeded; ++nth_call) {
+      auto opened = OpenCopy(*base, 5);
+      CHECK(opened.database != nullptr);
+      if (opened.database == nullptr) {
+        return;
+      }
+      Database& database = *opened.database;
+      opened.store->InjectFailure(operation, nth_call);
+      const auto status = database.DropTable("t");
+      opened.store->ClearInjectedFailures();
+      if (!status.has_value()) {
+        has_succeeded = true;
+      } else {
+        CHECK_ERROR(status, kIo);
+        ++failures_seen;
+      }
+      // The table is gone, or intact with a valid index.
+      if (database.catalog().FindTable("t").has_value()) {
+        CHECK_OK(database.CheckIndex("t"));
+        CHECK_EQ(RowsOf(database, "t").size(), std::size_t{700});
+      } else {
+        CHECK_ERROR(database.Table("t"), kNotFound);
+      }
+      CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+    }
+    CHECK(has_succeeded);
+    // A drop allocates no page, so an injected allocation failure never fires.
+    if (operation == Operation::kAllocate) {
+      CHECK_EQ(failures_seen, 0);
+    } else {
+      CHECK(failures_seen > 0);
+    }
+  }
+}
+
+namespace {
+
+// One thing rewritten in a closed database of table t (300 rows: an internal
+// root over two leaves) and table other, each page written with a valid
+// checksum.
+enum class Damage {
+  kRootIsHeapPage,
+  kRootOfAnotherTable,
+  kLeafKeyCountTooLarge,
+  kChildOfAnotherTable,
+  kChildPastTheEnd,
+  kRidNamesDeadSlot,
+  kKeyDiffersFromRow,
+  kLeafLinkReturnsToItself
+};
+
+struct DamageCase {
+  Damage damage;
+  const char* name;
+  // Database::Index fails, because the root does not open.
+  bool is_root_damaged;
+  // DropTable and AddColumn fail with kCorrupt before a page changes.
+  bool is_statement_refused;
+  // Contains(290) returns an error.
+  bool does_contains_fail;
+  // ScanRange from key 290 (the whole index for the link) ends with an error.
+  bool does_scan_fail;
+};
+
+// The key that the damage concerns: in the second leaf, the one that holds the
+// keys 146 to 300 after ascending inserts.
+constexpr std::int64_t kDamagedKey = 290;
+
+void ApplyDamage(MemoryPageStore& store, PageId root, PageId other_root,
+                 Damage damage) {
+  const strata::paged::NodeView root_node(store.PageBytes(root));
+  const PageId first_leaf = root_node.ChildAt(0);
+  const PageId second_leaf = root_node.ChildAt(1);
+  std::uint8_t* const root_page = store.MutablePage(root);
+  std::uint8_t* const leaf_page = store.MutablePage(second_leaf);
+  switch (damage) {
+    case Damage::kRootIsHeapPage:
+      root_page[strata::paged::layout::kPageTypeField] = 2;
+      break;
+    case Damage::kRootOfAnotherTable:
+      strata::paged::WriteLe32(root_page + strata::paged::layout::kTableId, 99);
+      break;
+    case Damage::kLeafKeyCountTooLarge:
+      strata::paged::WriteLe16(
+          leaf_page + strata::paged::node_layout::kKeyCount, 290);
+      break;
+    case Damage::kChildOfAnotherTable:
+      strata::paged::WriteLe32(
+          root_page + strata::paged::node_layout::kInternalChildren + 4,
+          other_root);
+      break;
+    case Damage::kChildPastTheEnd:
+      strata::paged::WriteLe32(
+          root_page + strata::paged::node_layout::kInternalChildren + 4,
+          store.PageCount() + 5);
+      break;
+    case Damage::kRidNamesDeadSlot: {
+      const strata::paged::LeafPosition position =
+          strata::paged::LeafSearch(leaf_page, kDamagedKey);
+      strata::paged::LeafSetRid(leaf_page, position.index,
+                                strata::paged::Rid{3, 60000});
+      break;
+    }
+    case Damage::kKeyDiffersFromRow: {
+      // The last key of the leaf becomes a key that no row has, and stays above
+      // the others.
+      const strata::paged::NodeView leaf(leaf_page);
+      const std::size_t last = leaf.key_count() - 1;
+      strata::paged::WriteLe64(
+          leaf_page + strata::paged::node_layout::kKeys + 8 * last, 99999);
+      break;
+    }
+    case Damage::kLeafLinkReturnsToItself:
+      strata::paged::WriteLe32(
+          store.MutablePage(first_leaf) + strata::paged::layout::kNextPageId,
+          first_leaf);
+      break;
+  }
+  strata::paged::SlottedPage::SealChecksum(root_page);
+  strata::paged::SlottedPage::SealChecksum(leaf_page);
+  strata::paged::SlottedPage::SealChecksum(store.MutablePage(first_leaf));
+}
+
+// Every page of the store, to see that a refused statement changed none.
+std::vector<std::vector<std::uint8_t>> PageImagesOf(
+    const MemoryPageStore& store) {
+  std::vector<std::vector<std::uint8_t>> images;
+  for (PageId page_id = 0; page_id < store.PageCount(); ++page_id) {
+    images.emplace_back(store.PageBytes(page_id),
+                        store.PageBytes(page_id) + kPageSize);
+  }
+  return images;
+}
+
+}  // namespace
+
+TEST(test_paged_database_reports_a_damaged_index) {
+  // A closed database: table t with 300 indexed rows, and a small table other.
+  std::unique_ptr<MemoryPageStore> base;
+  PageId root = 0;
+  PageId other_root = 0;
+  {
+    MemoryDatabase env = OpenNewMemoryDatabase();
+    if (env.database == nullptr) {
+      return;
+    }
+    strata::testing::FillIndexedTable(*env.database, "t", 300, 100);
+    strata::testing::FillIndexedTable(*env.database, "other", 5, 100);
+    root = env.database->catalog().IndexRoot("t").value_or(0);
+    other_root = env.database->catalog().IndexRoot("other").value_or(0);
+    CHECK_OK(env.database->Close());
+    base = strata::testing::CopyOfStore(*env.store);
+  }
+  const strata::paged::NodeView root_node(base->PageBytes(root));
+  CHECK_EQ(root_node.level(), std::uint16_t{1});
+  CHECK_EQ(root_node.key_count(), std::uint16_t{1});
+
+  const DamageCase cases[] = {
+      {Damage::kRootIsHeapPage, "root is a heap page", true, true, true, true},
+      {Damage::kRootOfAnotherTable, "root of another table", true, true, true,
+       true},
+      {Damage::kLeafKeyCountTooLarge, "leaf key_count 290", false, true, true,
+       true},
+      {Damage::kChildOfAnotherTable, "child of another table", false, true,
+       true, true},
+      {Damage::kChildPastTheEnd, "child past the end of the file", false, true,
+       true, true},
+      {Damage::kRidNamesDeadSlot, "Rid names a dead slot", false, false, false,
+       true},
+      {Damage::kKeyDiffersFromRow, "key differs from its row", false, false,
+       false, true},
+      {Damage::kLeafLinkReturnsToItself, "leaf link returns to itself", false,
+       false, false, true}};
+  for (const DamageCase& test_case : cases) {
+    std::unique_ptr<MemoryPageStore> damaged =
+        strata::testing::CopyOfStore(*base);
+    ApplyDamage(*damaged, root, other_root, test_case.damage);
+
+    // The read paths: Index, Contains, ScanRange and CheckIndex.
+    {
+      auto opened = OpenCopy(*damaged, 16);
+      CHECK(opened.database != nullptr);
+      if (opened.database == nullptr) {
+        return;
+      }
+      Database& database = *opened.database;
+      const auto index = database.Index("t");
+      if (test_case.is_root_damaged) {
+        CHECK_ERROR(index, kCorrupt);
+      } else {
+        CHECK_OK(index);
+      }
+      const strata::paged::DatabaseIndexReader reader(database);
+      const strata::paged::ContainsResult contains =
+          reader.Contains("t", kDamagedKey);
+      CHECK_EQ(std::holds_alternative<strata::domain::ExecutionError>(contains),
+               test_case.does_contains_fail);
+      if (const auto* error =
+              std::get_if<strata::domain::ExecutionError>(&contains)) {
+        CHECK(error->message.starts_with("corrupt: ") ||
+              error->message.find("corrupt") != std::string::npos);
+      }
+      strata::paged::KeyRange range;
+      if (test_case.damage != Damage::kLeafLinkReturnsToItself) {
+        range.low = kDamagedKey;
+      }
+      std::optional<std::string> scan_error;
+      strata::paged::ScanResult scanned = reader.ScanRange("t", range);
+      if (auto* error = std::get_if<strata::domain::ExecutionError>(&scanned)) {
+        scan_error = error->message;
+      } else {
+        auto& stream =
+            std::get<std::unique_ptr<strata::paged::IRowStream>>(scanned);
+        while (!scan_error.has_value()) {
+          strata::paged::StreamResult next = stream->Next();
+          if (auto* failure =
+                  std::get_if<strata::domain::ExecutionError>(&next)) {
+            scan_error = failure->message;
+          } else if (!std::get<std::optional<strata::paged::StoredRow>>(next)
+                          .has_value()) {
+            break;
+          }
+        }
+      }
+      CHECK_EQ(scan_error.has_value(), test_case.does_scan_fail);
+      if (scan_error.has_value()) {
+        CHECK(scan_error->find("corrupt") != std::string::npos);
+        // The two entries that the stream checks against their row have the
+        // messages of the design.
+        if (test_case.damage == Damage::kRidNamesDeadSlot) {
+          CHECK(scan_error->starts_with("corrupt: index of t names no row "));
+        } else if (test_case.damage == Damage::kKeyDiffersFromRow) {
+          CHECK(scan_error->starts_with(
+              "corrupt: index of t disagrees with its row "));
+        }
+      }
+      const auto check = database.CheckIndex("t");
+      CHECK_ERROR(check, kCorrupt);
+      // Another table still reads, and nothing stays pinned.
+      CHECK_EQ(RowsOf(database, "other").size(), std::size_t{5});
+      CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+    }
+
+    // DropTable and AddColumn: refused before any page changes, or applied.
+    const ColumnDef column{"extra", DataType::kInt, Value(std::int64_t{1})};
+    for (bool is_drop : {true, false}) {
+      auto opened = OpenCopy(*damaged, 16);
+      CHECK(opened.database != nullptr);
+      if (opened.database == nullptr) {
+        return;
+      }
+      Database& database = *opened.database;
+      const auto before = PageImagesOf(*opened.store);
+      strata::paged::Status status;
+      if (is_drop) {
+        status = database.DropTable("t");
+      } else {
+        const auto altered = database.AddColumn("t", column);
+        if (!altered.ok()) {
+          status = altered.error();
+        }
+      }
+      if (test_case.is_statement_refused) {
+        CHECK_ERROR(status, kCorrupt);
+        CHECK_OK(database.buffer().FlushAll());
+        CHECK(PageImagesOf(*opened.store) == before);
+      } else {
+        CHECK_OK(status);
+      }
+      CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+    }
+  }
+}
+
+namespace {
+
+// An engine over a copy of `base` with the damage applied, or null.
+std::unique_ptr<strata::paged::PagedEngine> EngineOverDamagedCopy(
+    const MemoryPageStore& base, PageId root, PageId other_root,
+    std::optional<Damage> damage) {
+  std::unique_ptr<MemoryPageStore> copy = strata::testing::CopyOfStore(base);
+  if (damage.has_value()) {
+    ApplyDamage(*copy, root, other_root, *damage);
+  }
+  auto opened = Database::OpenWithStore(std::move(copy),
+                                        strata::paged::DatabaseOptions{});
+  CHECK_OK(opened);
+  if (!opened.ok()) {
+    return nullptr;
+  }
+  return std::make_unique<strata::paged::PagedEngine>(std::move(opened).value(),
+                                                      nullptr);
+}
+
+}  // namespace
+
+// PagedEngine::DescribeIndex on the database of the test above: a sound tree, a
+// damaged node below the root, a damaged root and an unknown table.
+TEST(test_paged_engine_describe_index_reports_a_damaged_tree) {
+  std::unique_ptr<MemoryPageStore> base;
+  PageId root = 0;
+  PageId other_root = 0;
+  {
+    MemoryDatabase env = OpenNewMemoryDatabase();
+    if (env.database == nullptr) {
+      return;
+    }
+    strata::testing::FillIndexedTable(*env.database, "t", 300, 100);
+    strata::testing::FillIndexedTable(*env.database, "other", 5, 100);
+    root = env.database->catalog().IndexRoot("t").value_or(0);
+    other_root = env.database->catalog().IndexRoot("other").value_or(0);
+    CHECK_OK(env.database->Close());
+    base = strata::testing::CopyOfStore(*env.store);
+  }
+  struct Case {
+    std::optional<Damage> damage;
+    std::size_t node_count;  // the nodes that the walk read
+    bool is_check_ok;
+  };
+  const Case cases[] = {{std::nullopt, 3, true},
+                        {Damage::kLeafKeyCountTooLarge, 2, false},
+                        {Damage::kChildPastTheEnd, 2, false}};
+  for (const Case& test_case : cases) {
+    auto engine =
+        EngineOverDamagedCopy(*base, root, other_root, test_case.damage);
+    if (engine == nullptr) {
+      return;
+    }
+    const strata::domain::IndexDescriptionResult result =
+        engine->DescribeIndex("T");
+    const auto* description =
+        std::get_if<strata::domain::IndexDescription>(&result);
+    CHECK(description != nullptr);
+    if (description != nullptr) {
+      CHECK_EQ(description->table, std::string("t"));
+      CHECK_EQ(description->column, std::string("id"));
+      CHECK_EQ(description->node_count, test_case.node_count);
+      CHECK_EQ(description->nodes.size(), test_case.node_count);
+      CHECK_EQ(description->check == "ok", test_case.is_check_ok);
+      if (test_case.is_check_ok) {
+        CHECK_EQ(description->height, std::size_t{2});
+        CHECK_EQ(description->key_count, std::size_t{300});
+      }
+    }
+    CHECK_EQ(engine->database().buffer().PinnedFrameCount(), std::size_t{0});
+  }
+
+  auto engine =
+      EngineOverDamagedCopy(*base, root, other_root, Damage::kRootIsHeapPage);
+  if (engine == nullptr) {
+    return;
+  }
+  const strata::domain::IndexDescriptionResult damaged_root =
+      engine->DescribeIndex("t");
+  const auto* root_error =
+      std::get_if<strata::domain::ExecutionError>(&damaged_root);
+  CHECK(root_error != nullptr);
+  if (root_error != nullptr) {
+    CHECK(root_error->kind == strata::domain::ErrorKind::kIo);
+    CHECK(root_error->message.starts_with("corrupt: "));
+  }
+  const strata::domain::IndexDescriptionResult unknown =
+      engine->DescribeIndex("nosuch");
+  const auto* unknown_error =
+      std::get_if<strata::domain::ExecutionError>(&unknown);
+  CHECK(unknown_error != nullptr);
+  if (unknown_error != nullptr) {
+    CHECK(unknown_error->kind == strata::domain::ErrorKind::kBind);
+    CHECK_EQ(unknown_error->message, std::string("unknown table: nosuch"));
+  }
+  CHECK_EQ(engine->database().buffer().PinnedFrameCount(), std::size_t{0});
 }

@@ -1,9 +1,11 @@
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "strata/paged/btree_node.h"
 #include "strata/paged/buffer_manager.h"
 #include "strata/paged/byte_codec.h"
 #include "strata/paged/database.h"
@@ -353,5 +355,235 @@ TEST(test_paged_allocator_refuses_a_successor_below_page_3) {
     CHECK_ERROR(allocated, kCorrupt);
     CHECK_MESSAGE_CONTAINS(allocated, "page " + std::to_string(target));
     CHECK_EQ(FreeListHeadOf(database.buffer()), chain.front());
+  }
+}
+
+namespace {
+
+enum class NewPageKind { kHeap, kIndexNode, kUnformatted };
+
+// A page that no chain links, taken from BufferManager::NewPage and not from
+// Allocate, so the free list is not touched.
+PageId AddPage(strata::paged::BufferManager& buffer, NewPageKind kind) {
+  auto created = buffer.NewPage();
+  CHECK_OK(created);
+  if (!created.ok()) {
+    return kInvalidPageId;
+  }
+  PageGuard guard = std::move(created).value();
+  if (kind == NewPageKind::kHeap) {
+    SlottedPage::Format(guard.mutable_data(), guard.page_id(), 77);
+  } else if (kind == NewPageKind::kIndexNode) {
+    strata::paged::FormatLeaf(guard.mutable_data(), guard.page_id(), 77);
+  }
+  guard.MarkDirty();
+  return guard.page_id();
+}
+
+// The bytes of every page, read through the pool.
+std::vector<strata::testing::Page> SnapshotOf(
+    strata::paged::BufferManager& buffer) {
+  std::vector<strata::testing::Page> pages;
+  for (PageId page_id = 0; page_id < buffer.PageCount(); ++page_id) {
+    auto fetched = buffer.FetchPage(page_id, LatchMode::kShared);
+    CHECK_OK(fetched);
+    strata::testing::Page copy{};
+    if (fetched.ok()) {
+      std::copy(fetched.value().data(),
+                fetched.value().data() + strata::paged::kPageSize,
+                copy.begin());
+    }
+    pages.push_back(copy);
+  }
+  return pages;
+}
+
+}  // namespace
+
+TEST(test_paged_allocator_release_pages_frees_an_explicit_list) {
+  MemoryDatabase env = OpenNewMemoryDatabase();
+  if (env.database == nullptr) {
+    return;
+  }
+  Database& database = *env.database;
+  const std::vector<PageId> earlier = MakeChain(database, "t", 2);
+  CHECK_EQ(earlier.size(), std::size_t{2});
+  CHECK_OK(database.allocator().Release(earlier.front()));
+
+  // Three heap pages and two index nodes, in an order that is not page order.
+  std::vector<PageId> created;
+  const NewPageKind kinds[] = {NewPageKind::kHeap, NewPageKind::kIndexNode,
+                               NewPageKind::kHeap, NewPageKind::kIndexNode,
+                               NewPageKind::kHeap};
+  for (NewPageKind kind : kinds) {
+    created.push_back(AddPage(database.buffer(), kind));
+  }
+  const std::size_t order[] = {3, 0, 4, 2, 1};
+  std::vector<PageId> listed;
+  for (std::size_t position : order) {
+    listed.push_back(created[position]);
+  }
+  const PageId page_count = database.buffer().PageCount();
+
+  CHECK_OK(database.allocator().ReleasePages(listed));
+  CHECK_OK(database.buffer().FlushAll());
+
+  std::vector<PageId> expected = listed;
+  expected.insert(expected.end(), earlier.begin(), earlier.end());
+  CHECK_EQ(FreePagesOf(database), expected);
+  CHECK_EQ(FreeListHeadOf(database.buffer()), listed.front());
+  for (PageId page_id : listed) {
+    auto fetched = database.buffer().FetchPage(page_id, LatchMode::kShared);
+    CHECK_OK(fetched);
+    if (fetched.ok()) {
+      const SlottedPageView view(fetched.value().data());
+      CHECK(view.page_type() == PageType::kFree);
+      CHECK_EQ(view.table_id(), std::uint32_t{0});
+      CHECK_EQ(view.slot_count(), 0);
+    }
+  }
+
+  std::vector<PageId> reused;
+  for (std::size_t call = 0; call < expected.size(); ++call) {
+    auto page = database.allocator().Allocate();
+    CHECK_OK(page);
+    if (!page.ok()) {
+      return;
+    }
+    reused.push_back(page.value().page_id());
+  }
+  CHECK_EQ(reused, expected);
+  CHECK_EQ(database.buffer().PageCount(), page_count);
+  CHECK_EQ(FreeListHeadOf(database.buffer()), PageId{0});
+  // An empty list changes nothing.
+  CHECK_OK(database.allocator().ReleasePages({}));
+  CHECK_EQ(FreeListHeadOf(database.buffer()), PageId{0});
+}
+
+TEST(test_paged_allocator_release_pages_refuses_an_invalid_list) {
+  MemoryDatabase env = OpenNewMemoryDatabase();
+  if (env.database == nullptr) {
+    return;
+  }
+  Database& database = *env.database;
+  const std::vector<PageId> free_chain = MakeChain(database, "t", 2);
+  CHECK_EQ(free_chain.size(), std::size_t{2});
+  CHECK_OK(database.allocator().Release(free_chain.front()));
+  const PageId heap_page = AddPage(database.buffer(), NewPageKind::kHeap);
+  const PageId other_heap_page = AddPage(database.buffer(), NewPageKind::kHeap);
+  const PageId unformatted_page =
+      AddPage(database.buffer(), NewPageKind::kUnformatted);
+  const PageId page_count = database.buffer().PageCount();
+  CHECK_OK(database.buffer().FlushAll());
+
+  struct Refusal {
+    std::vector<PageId> pages;
+    const char* code;
+    std::string named_page;
+  };
+  const std::vector<Refusal> refusals = {
+      {{heap_page, other_heap_page, heap_page},
+       "kCorrupt",
+       "page " + std::to_string(heap_page)},
+      {{heap_page, 2}, "kInvalidArgument", "page 2"},
+      {{0}, "kInvalidArgument", "page 0"},
+      {{heap_page, page_count + 5},
+       "kCorrupt",
+       "page " + std::to_string(page_count + 5)},
+      {{heap_page, free_chain.back()},
+       "kCorrupt",
+       "page " + std::to_string(free_chain.back())},
+      {{unformatted_page},
+       "kCorrupt",
+       "page " + std::to_string(unformatted_page)}};
+
+  const PageId head_before = FreeListHeadOf(database.buffer());
+  const std::vector<strata::testing::Page> pages_before =
+      SnapshotOf(database.buffer());
+  for (const Refusal& refusal : refusals) {
+    const auto status = database.allocator().ReleasePages(refusal.pages);
+    CHECK_EQ(strata::testing::ErrorName(status), std::string(refusal.code));
+    CHECK_MESSAGE_CONTAINS(status, refusal.named_page);
+    CHECK_EQ(FreeListHeadOf(database.buffer()), head_before);
+    CHECK(SnapshotOf(database.buffer()) == pages_before);
+    CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+  }
+}
+
+TEST(test_paged_allocator_release_pages_keeps_the_list_whole_when_io_fails) {
+  // A closed database with a 2-page free list and six pages that no chain
+  // links, so that every page is in the store.
+  std::unique_ptr<strata::paged::MemoryPageStore> base_copy;
+  std::vector<PageId> listed;
+  std::vector<PageId> old_list;
+  {
+    MemoryDatabase env = OpenNewMemoryDatabase();
+    if (env.database == nullptr) {
+      return;
+    }
+    Database& database = *env.database;
+    old_list = MakeChain(database, "earlier", 2);
+    CHECK_EQ(old_list.size(), std::size_t{2});
+    if (old_list.size() != 2) {
+      return;
+    }
+    CHECK_OK(database.allocator().Release(old_list.front()));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kHeap));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kIndexNode));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kHeap));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kIndexNode));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kHeap));
+    listed.push_back(AddPage(database.buffer(), NewPageKind::kIndexNode));
+    CHECK_OK(database.Close());
+    base_copy = strata::testing::CopyOfStore(*env.store);
+  }
+
+  // The pool has 4 frames and the list has 6 pages, so the pages that the
+  // check reads first are evicted and read again while the list is formatted.
+  const Operation operations[] = {Operation::kRead, Operation::kWrite};
+  for (const Operation operation : operations) {
+    bool has_succeeded = false;
+    int failures_seen = 0;
+    for (int nth_call = 1; nth_call < 200 && !has_succeeded; ++nth_call) {
+      auto opened = strata::testing::OpenCopy(*base_copy, 4);
+      CHECK(opened.database != nullptr);
+      if (opened.database == nullptr) {
+        return;
+      }
+      Database& database = *opened.database;
+      opened.store->InjectFailure(operation, nth_call);
+      const strata::paged::Status release =
+          database.allocator().ReleasePages(listed);
+      const strata::paged::Status write_back =
+          release.has_value() ? strata::paged::Status()
+                              : database.buffer().WriteBackAll();
+      opened.store->ClearInjectedFailures();
+      const bool is_applied = !release.has_value();
+      if (!release.has_value() && !write_back.has_value()) {
+        has_succeeded = true;
+      } else {
+        CHECK_ERROR(release.has_value() ? release : write_back, kIo);
+        ++failures_seen;
+      }
+      CHECK_EQ(database.buffer().PinnedFrameCount(), std::size_t{0});
+      // The free list on disk after a clean write-out is whole: the new list
+      // when the call applied, and the old list when it failed, because the
+      // head changes last and the pages already formatted are only unreachable.
+      CHECK_OK(database.buffer().FlushAll());
+      const auto reopened = strata::testing::OpenCopy(*opened.store, 16);
+      CHECK(reopened.database != nullptr);
+      if (reopened.database == nullptr) {
+        return;
+      }
+      std::vector<PageId> expected = old_list;
+      if (is_applied) {
+        expected = listed;
+        expected.insert(expected.end(), old_list.begin(), old_list.end());
+      }
+      CHECK_EQ(FreePagesOf(*reopened.database), expected);
+    }
+    CHECK(has_succeeded);
+    // The failures really happened: the sweep is not a run of successes.
+    CHECK(failures_seen > 0);
   }
 }

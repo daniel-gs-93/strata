@@ -15,6 +15,11 @@ namespace {
 
 constexpr const char* kOverflowMessage = "numeric overflow";
 constexpr const char* kDivisionByZeroMessage = "division by zero";
+// The longest TEXT that `||` may produce. A chain of at most 500 operators can
+// otherwise turn one long value into hundreds of copies of it.
+constexpr std::size_t kMaxConcatBytes = std::size_t{16} * 1024 * 1024;
+constexpr const char* kConcatTooLongMessage =
+    "result of || is longer than 16777216 bytes";
 
 std::nullopt_t Fail(std::string* failure, const char* message) {
   if (failure != nullptr) {
@@ -140,7 +145,13 @@ std::optional<Value> EvaluateBinary(const BoundBinary& binary, const Row& row,
     return std::nullopt;
   }
   if (binary.op == BinaryOp::kConcat) {
-    return Value(std::get<std::string>(*lhs) + std::get<std::string>(*rhs));
+    const std::string& left = std::get<std::string>(*lhs);
+    const std::string& right = std::get<std::string>(*rhs);
+    if (left.size() > kMaxConcatBytes ||
+        right.size() > kMaxConcatBytes - left.size()) {
+      return Fail(failure, kConcatTooLongMessage);
+    }
+    return Value(left + right);
   }
   return Arithmetic(binary.op, *lhs, *rhs, failure);
 }

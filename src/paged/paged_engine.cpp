@@ -53,8 +53,9 @@ bool IsWriteNode(const PlanNode& plan) {
 // Builds the operator tree and pulls it dry. Touches only locals and the
 // reader, so several threads may run it at the same time. The tree is
 // destroyed before the function returns.
-ExecutionResult RunQuery(const PlanNode& plan, const ITableReader& reader) {
-  BuildResult built = BuildOperatorTree(plan, reader);
+ExecutionResult RunQuery(const PlanNode& plan, const ITableReader& reader,
+                         const IIndexReader& index_reader) {
+  BuildResult built = BuildOperatorTree(plan, reader, &index_reader);
   if (auto* error = std::get_if<ExecutionError>(&built)) {
     return std::move(*error);
   }
@@ -99,7 +100,9 @@ std::optional<ExecutionError> WriteBack(Database& database) {
 // earlier failed statement and fail this one for a change it never made.
 ExecutionResult RunWrite(const PlanNode& plan, Database& database) {
   DatabaseTableReader reader(database);
-  PlanMutationResult planned = PlanMutation(plan, database.catalog(), reader);
+  const DatabaseIndexReader index_reader(database);
+  PlanMutationResult planned =
+      PlanMutation(plan, database.catalog(), reader, &index_reader);
   if (auto* error = std::get_if<ExecutionError>(&planned)) {
     return std::move(*error);
   }
@@ -215,7 +218,8 @@ const domain::ICatalog& PagedEngine::Catalog() const { return *catalog_; }
 ExecutionResult PagedEngine::Execute(const PlanNode& plan) {
   if (IsQueryNode(plan)) {
     const DatabaseTableReader reader(database_);
-    return RunQuery(plan, reader);
+    const DatabaseIndexReader index_reader(database_);
+    return RunQuery(plan, reader, index_reader);
   }
   if (IsWriteNode(plan)) {
     return RunWrite(plan, database_);
@@ -233,6 +237,59 @@ ExecutionResult PagedEngine::Execute(const PlanNode& plan) {
     return RunDropTable(*drop, database_);
   }
   return Unsupported("unknown plan node");
+}
+
+namespace {
+
+domain::IndexNodeDescription DescribeNode(const NodeSummary& node) {
+  domain::IndexNodeDescription description;
+  description.level = node.level;
+  description.page_id = static_cast<std::uint32_t>(node.page_id);
+  description.key_count = node.key_count;
+  description.first_key = node.first_key;
+  description.last_key = node.last_key;
+  if (node.next_page_id != kInvalidPageId) {
+    description.next_page_id = static_cast<std::uint32_t>(node.next_page_id);
+  }
+  return description;
+}
+
+}  // namespace
+
+domain::IndexDescriptionResult PagedEngine::DescribeIndex(
+    const std::string& table) {
+  const ErrorContext context{ErrorSite::kOpenTable, table};
+  PageResult<BTree*> opened = database_.Index(table);
+  if (!opened.ok()) {
+    return ToExecutionError(opened.error(), context);
+  }
+  const BTree* const tree = opened.value();
+  if (tree == nullptr) {
+    return ExecutionError{ErrorKind::kBind, "table " + table + " has no index"};
+  }
+  const std::optional<TableSchema> schema =
+      database_.catalog().FindTable(table);
+  if (!schema.has_value()) {
+    return ToExecutionError(PageError{PageErrorCode::kNotFound, table},
+                            context);
+  }
+  PageResult<TreeShape> shape = tree->Shape(domain::kMaxDescribedIndexNodes);
+  if (!shape.ok()) {
+    return ToExecutionError(shape.error(), context);
+  }
+  const Status check = database_.CheckIndex(table);
+
+  domain::IndexDescription description;
+  description.table = schema->name;
+  description.column = schema->columns[schema->primary_key_index].name;
+  description.height = shape.value().height;
+  description.node_count = shape.value().node_count;
+  description.key_count = shape.value().key_count;
+  for (const NodeSummary& node : shape.value().nodes) {
+    description.nodes.push_back(DescribeNode(node));
+  }
+  description.check = check.has_value() ? check->message : "ok";
+  return description;
 }
 
 RowCountResult PagedEngine::RowCounts() {

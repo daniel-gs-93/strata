@@ -61,6 +61,26 @@ class EndToEndTest(unittest.TestCase):
         areas = {statement.differs for statement in statements if statement.differs}
         self.assertEqual(areas, set(differential.AREAS))
 
+    def test_end_to_end_corpus_covers_indexed_reads(self) -> None:
+        text = CORPUS_PATH.read_text(encoding="utf-8")
+        statements = differential.parse_corpus(text)
+        key_reads = [
+            statement
+            for statement in statements
+            if re.search(r"\bFROM keyed WHERE id\b", statement.text)
+        ]
+        self.assertGreaterEqual(len(key_reads), 12)
+        self.assertEqual(
+            [statement for statement in key_reads if statement.differs], []
+        )
+        self.assertEqual(len(marker_lines(text)), 23)
+        status, lines = run_main(text)
+        self.assertEqual(status, 0, msg="\n".join(lines))
+        summary = SUMMARY_LINE.fullmatch(lines[-1])
+        self.assertIsNotNone(summary, msg=lines[-1])
+        if summary is not None:
+            self.assertEqual(int(summary.group(2)), 23)
+
     def test_end_to_end_markers_are_enforced(self) -> None:
         lines = CORPUS_PATH.read_text(encoding="utf-8").splitlines()
         first_marker = marker_lines("\n".join(lines))[0]

@@ -561,8 +561,26 @@ bool IsNewFile(const StagedFile& file) {
   return file.write != nullptr && file.write->is_new_file;
 }
 
+// A symbolic link at the .temp path is refused: the staged write opens that
+// path and would follow the link, so the new content would land in the link's
+// target. A leftover regular file or a directory there is not refused; the
+// write replaces the file or fails.
+std::optional<std::string> RefuseLinkedTemp(const StagedFile& file) {
+  if (file.kind == StagedKind::kDrop) {
+    return std::nullopt;
+  }
+  std::error_code error;
+  const std::filesystem::file_status status =
+      std::filesystem::symlink_status(file.temp_path, error);
+  if (status.type() == std::filesystem::file_type::symlink) {
+    return NotRegularFile(file.display_name + ".temp");
+  }
+  return std::nullopt;
+}
+
 // Refuses a leftover .orig, an existing target of a new file, a target that is
-// not a regular file and a read-only target, and records which targets exist.
+// not a regular file, a read-only target and a symbolic link at a .temp path,
+// and records which targets exist.
 std::optional<std::string> InspectTargets(std::vector<StagedFile>& staged) {
   for (auto& file : staged) {
     PathKind orig_kind = PathKind::kOther;
@@ -590,6 +608,9 @@ std::optional<std::string> InspectTargets(std::vector<StagedFile>& staged) {
     file.has_original = kind == PathKind::kRegularFile;
     if (file.has_original && !IsOwnerWritable(file.path)) {
       return CouldNotWrite(file);
+    }
+    if (std::optional<std::string> linked = RefuseLinkedTemp(file)) {
+      return linked;
     }
   }
   return std::nullopt;

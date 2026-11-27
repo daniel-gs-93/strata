@@ -154,8 +154,52 @@ inline std::vector<paged::PageId> MakeChain(paged::Database& database,
   return ChainOf(database.buffer(), heap.value()->first_page());
 }
 
-// True when the file header, the system tables, the live tables and the free
-// list together name every page of the store exactly once.
+// Creates table `name` (BodySchema) and inserts `rows` rows of `body_length`
+// bytes into its heap and, with the Rid of each, into its index, so that the
+// two agree. The tests that call it work on Database and not on the engine,
+// which keeps the index of a table it writes.
+inline void FillIndexedTable(paged::Database& database, const std::string& name,
+                             std::int64_t rows, std::size_t body_length) {
+  CHECK_OK(database.CreateTable(BodySchema(name)));
+  auto heap = database.Table(name);
+  auto tree = database.Index(name);
+  CHECK_OK(heap);
+  CHECK_OK(tree);
+  if (!heap.ok() || !tree.ok() || tree.value() == nullptr) {
+    CHECK(false);
+    return;
+  }
+  for (std::int64_t id = 1; id <= rows; ++id) {
+    auto rid = heap.value()->Insert(BodyRow(id, body_length));
+    CHECK_OK(rid);
+    if (!rid.ok()) {
+      return;
+    }
+    CHECK_OK(tree.value()->Insert(id, rid.value()));
+  }
+}
+
+// The pages of the index of a table in the order of BTree::Pages, or none when
+// the table has no index.
+inline std::vector<paged::PageId> IndexPagesOf(paged::Database& database,
+                                               const std::string& name) {
+  std::vector<paged::PageId> pages;
+  auto tree = database.Index(name);
+  CHECK_OK(tree);
+  if (!tree.ok() || tree.value() == nullptr) {
+    return pages;
+  }
+  auto listed = tree.value()->Pages();
+  CHECK_OK(listed);
+  if (listed.ok()) {
+    pages = listed.value();
+  }
+  return pages;
+}
+
+// True when the file header, the system tables, the live tables with their
+// indexes and the free list together name every page of the store exactly
+// once.
 inline bool EveryPageIsAccountedFor(paged::Database& database) {
   std::vector<paged::PageId> pages{0};
   for (paged::PageId system_first : {paged::PageId{1}, paged::PageId{2}}) {
@@ -169,6 +213,9 @@ inline bool EveryPageIsAccountedFor(paged::Database& database) {
       return false;
     }
     for (paged::PageId page : ChainOf(database.buffer(), *first)) {
+      pages.push_back(page);
+    }
+    for (paged::PageId page : IndexPagesOf(database, name)) {
       pages.push_back(page);
     }
   }

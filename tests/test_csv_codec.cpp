@@ -273,6 +273,18 @@ TEST(test_catalog_parse_rejects_invalid_files) {
        "username"},
       {header + "catalog,0,id,INT,1,0,0,0,,,\n", "catalog"},
       {header + "visitors,0,id,INT,1,0,0,0,,\n", "fields"},
+      {header + ",0,id,INT,1,0,0,0,,,\n", "must not be empty"},
+      {header + "visitors,x,id,INT,1,0,0,0,,,\n", "is not a number"},
+      {header + "visitors,0,id,INT,2,0,0,0,,,\n", "must be 0 or 1"},
+      {header + "visitors,0,id,INT,1,0,0,0,,,\nvisitors,1,n,INT,0,0,0,0,5,,\n",
+       "has a default but no flag"},
+      {header + visitors + "stories,0,id,INT,1,0,0,0,,,\n" +
+           "stories,1,owner,TEXT,0,0,0,0,,visitors,\n",
+       "go together"},
+      {header + "visitors,0,id,INT,1,1,0,0,,,\n",
+       "cannot be marked unique or have a default"},
+      {header + "visitors,0,id,INT,1,0,0,1,5,,\n",
+       "cannot be marked unique or have a default"},
   };
 
   for (const Case& test_case : cases) {

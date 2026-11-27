@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "strata/domain/expression.h"
+#include "strata/paged/key_range.h"
 #include "strata/paged/row_keys.h"
 #include "strata/paged/tuple_codec.h"
 
@@ -122,13 +123,11 @@ class RowVisitor {
   virtual std::optional<ExecutionError> Visit(StoredRow&& stored) = 0;
 };
 
-// Reads the table once, from its first row to its end, handing each row to the
+// Reads a stream from its first row to its end, handing each row to the
 // visitor. Holds one row at a time, so memory does not grow with the table.
-// Returns the error of Scan, of the stream or of the visitor.
-std::optional<ExecutionError> ScanRows(const ITableReader& reader,
-                                       const std::string& table,
-                                       RowVisitor* visitor) {
-  ScanResult scanned = reader.Scan(table);
+// Returns the error that opened the stream, of the stream or of the visitor.
+std::optional<ExecutionError> VisitStream(ScanResult scanned,
+                                          RowVisitor* visitor) {
   if (auto* error = std::get_if<ExecutionError>(&scanned)) {
     return std::move(*error);
   }
@@ -146,6 +145,39 @@ std::optional<ExecutionError> ScanRows(const ITableReader& reader,
       return error;
     }
   }
+}
+
+// Reads the table once, from its first row to its end, handing each row to the
+// visitor. Returns the error of Scan, of the stream or of the visitor.
+std::optional<ExecutionError> ScanRows(const ITableReader& reader,
+                                       const std::string& table,
+                                       RowVisitor* visitor) {
+  return VisitStream(reader.Scan(table), visitor);
+}
+
+// Hands the visitor the rows that `predicate` may keep. When index_reader is
+// given, the table has an indexed column and ExtractKeyRange finds a range in
+// the predicate, the rows come from ScanRange, in ascending key order, and no
+// other row is read; the caller still tests the whole predicate on each row.
+// Otherwise it is ScanRows: every row, in storage order. A null predicate is
+// every row. Borrows index_reader and predicate for the call.
+std::optional<ExecutionError> ScanWhereRows(const ITableReader& reader,
+                                            const IIndexReader* index_reader,
+                                            const std::string& table,
+                                            const BoundExpr* predicate,
+                                            RowVisitor* visitor) {
+  if (index_reader != nullptr && predicate != nullptr) {
+    const std::optional<std::size_t> column =
+        index_reader->IndexedColumn(table);
+    if (column.has_value()) {
+      const std::optional<KeyRange> range =
+          ExtractKeyRange(*predicate, *column);
+      if (range.has_value()) {
+        return VisitStream(index_reader->ScanRange(table, *range), visitor);
+      }
+    }
+  }
+  return ScanRows(reader, table, visitor);
 }
 
 // The ExactKey sets of a list of columns of one table. Add grows every set with
@@ -217,9 +249,27 @@ class KeyCollector : public RowVisitor {
 struct ParentKeys {
   TableSchema schema;
   KeySets keys;  // one column: the referenced column
+  // True when the referenced column is the indexed primary key of the parent:
+  // `keys` is then empty and a value is looked up with IIndexReader::Contains.
+  bool is_indexed = false;
 };
 
 using ParentLoad = std::variant<ParentKeys, ExecutionError>;
+
+// The schema of the parent of foreign_key with no keys loaded, for a parent
+// whose referenced column is indexed.
+ParentLoad LoadIndexedParent(const domain::ICatalog& catalog,
+                             const ForeignKey& foreign_key) {
+  std::optional<TableSchema> parent_schema =
+      catalog.FindTable(foreign_key.ref_table);
+  if (!parent_schema.has_value()) {
+    return UnknownTableError(foreign_key.ref_table);
+  }
+  ParentKeys parent{std::move(*parent_schema),
+                    KeySets({foreign_key.ref_column_index})};
+  parent.is_indexed = true;
+  return parent;
+}
 
 // Scans the parent table of foreign_key once.
 ParentLoad LoadParentKeys(const domain::ICatalog& catalog,
@@ -329,24 +379,46 @@ std::vector<std::size_t> UniqueColumns(const TableSchema& schema) {
 }
 
 // Foreign key check of one INSERT row, in declaration order. parents holds one
-// slot per foreign key; a slot is filled by scanning the parent table the first
-// time a row reaches that foreign key, and reused by the later rows. Borrows
-// parents for the call.
+// slot per foreign key; a slot is filled the first time a row reaches that
+// foreign key and reused by the later rows: by scanning the parent table, or,
+// when index_reader is given and the referenced column is the indexed primary
+// key of the parent, by taking its schema only, and each row is then looked up
+// with Contains. Borrows parents for the call.
 std::optional<ExecutionError> CheckInsertForeignKeys(
     const domain::ICatalog& catalog, const ITableReader& reader,
-    const TableSchema& schema, const Row& row,
+    const IIndexReader* index_reader, const TableSchema& schema, const Row& row,
     std::vector<std::optional<ParentKeys>>* parents) {
   for (std::size_t i = 0; i < schema.foreign_keys.size(); ++i) {
     const ForeignKey& foreign_key = schema.foreign_keys[i];
     std::optional<ParentKeys>& parent = (*parents)[i];
     if (!parent.has_value()) {
-      ParentLoad loaded = LoadParentKeys(catalog, reader, foreign_key);
+      const bool is_indexed =
+          index_reader != nullptr &&
+          index_reader->IndexedColumn(foreign_key.ref_table) ==
+              std::optional<std::size_t>(foreign_key.ref_column_index);
+      ParentLoad loaded = is_indexed
+                              ? LoadIndexedParent(catalog, foreign_key)
+                              : LoadParentKeys(catalog, reader, foreign_key);
       if (auto* error = std::get_if<ExecutionError>(&loaded)) {
         return std::move(*error);
       }
       parent = std::move(std::get<ParentKeys>(loaded));
     }
     const Value& value = row[foreign_key.column_index];
+    if (parent->is_indexed) {
+      // The foreign key column has the type of the referenced INT column.
+      if (const auto* key = std::get_if<std::int64_t>(&value)) {
+        ContainsResult present =
+            index_reader->Contains(parent->schema.name, *key);
+        if (auto* error = std::get_if<ExecutionError>(&present)) {
+          return std::move(*error);
+        }
+        if (std::get<bool>(present)) {
+          continue;
+        }
+      }
+      return NoMatchingRowError(schema, foreign_key, parent->schema, value);
+    }
     if (parent->keys.Contains(0, value)) {
       continue;
     }
@@ -362,17 +434,30 @@ std::optional<ExecutionError> CheckInsertForeignKeys(
 // returned. insert.rows is copied; the node is not modified.
 PlanMutationResult PlanInsert(const domain::InsertNode& insert,
                               const domain::ICatalog& catalog,
-                              const ITableReader& reader) {
+                              const ITableReader& reader,
+                              const IIndexReader* index_reader) {
   std::optional<TableSchema> found = catalog.FindTable(insert.table);
   if (!found.has_value()) {
     return UnknownTableError(insert.table);
   }
   const TableSchema& schema = *found;
 
+  // With the primary key indexed, no UNIQUE column and no generated value, the
+  // target is not scanned: the only key that can collide is the primary key,
+  // and each row asks the index with Contains. A UNIQUE column needs the other
+  // rows' values, and a generated value needs the largest key, which a lazy
+  // delete can leave far from the rightmost leaf (ADR-0051).
+  const bool is_key_looked_up =
+      index_reader != nullptr &&
+      index_reader->IndexedColumn(schema.name) ==
+          std::optional<std::size_t>(schema.primary_key_index) &&
+      schema.unique_indexes.empty() && !insert.generated_index.has_value();
   KeySets unique_keys(UniqueColumns(schema));
   KeyCollector existing(&unique_keys, insert.generated_index);
-  if (auto error = ScanRows(reader, schema.name, &existing)) {
-    return std::move(*error);
+  if (!is_key_looked_up) {
+    if (auto error = ScanRows(reader, schema.name, &existing)) {
+      return std::move(*error);
+    }
   }
 
   std::vector<std::optional<ParentKeys>> parents(schema.foreign_keys.size());
@@ -393,8 +478,21 @@ PlanMutationResult PlanInsert(const domain::InsertNode& insert,
     if (std::optional<std::size_t> column = unique_keys.FindDuplicate(row)) {
       return DuplicateKeyError(schema, *column, row[*column]);
     }
-    if (auto error =
-            CheckInsertForeignKeys(catalog, reader, schema, row, &parents)) {
+    if (is_key_looked_up) {
+      // The key sets hold the earlier rows of this statement; the index holds
+      // the rows that were there before it.
+      const Value& key = row[schema.primary_key_index];
+      ContainsResult present =
+          index_reader->Contains(schema.name, std::get<std::int64_t>(key));
+      if (auto* error = std::get_if<ExecutionError>(&present)) {
+        return std::move(*error);
+      }
+      if (std::get<bool>(present)) {
+        return DuplicateKeyError(schema, schema.primary_key_index, key);
+      }
+    }
+    if (auto error = CheckInsertForeignKeys(catalog, reader, index_reader,
+                                            schema, row, &parents)) {
       return std::move(*error);
     }
     unique_keys.Add(row);
@@ -703,10 +801,14 @@ std::optional<ExecutionError> CheckStagedLengths(
 // The order of the checks is the order of design document 2.13 and 2.5: WHERE
 // on every row (first pass), the assignments (second pass), then, on the rows
 // whose value changed, tuple length, uniqueness, foreign keys, and finally the
-// cascade with the tuple length of the rewritten child rows.
+// cascade with the tuple length of the rewritten child rows. The first pass
+// reads through the index when the WHERE has a key range, unless an assigned
+// column must stay unique: the uniqueness check counts the rows the WHERE does
+// not select, so that statement reads the whole table.
 PlanMutationResult PlanUpdate(const domain::UpdateNode& update,
                               const domain::ICatalog& catalog,
-                              const ITableReader& reader) {
+                              const ITableReader& reader,
+                              const IIndexReader* index_reader) {
   std::optional<TableSchema> found = catalog.FindTable(update.table);
   if (!found.has_value()) {
     return UnknownTableError(update.table);
@@ -724,7 +826,9 @@ PlanMutationResult PlanUpdate(const domain::UpdateNode& update,
 
   // First pass: one scan of the target.
   RowSelector selector(update.predicate.get(), unique_columns);
-  if (auto error = ScanRows(reader, schema.name, &selector)) {
+  if (auto error =
+          ScanWhereRows(reader, unique_columns.empty() ? index_reader : nullptr,
+                        schema.name, update.predicate.get(), &selector)) {
     return std::move(*error);
   }
   std::vector<StoredRow> selected = selector.TakeSelected();
@@ -808,13 +912,15 @@ ExecutionError ReferencedError(const TableSchema& schema, const Row& row,
           QualifiedName(reference.child, reference.foreign_key.column_index));
 }
 
-// Scans the target to select rows, then scans each referencing child table
-// once. The selected rows are checked in scan order and the references in
-// catalog order and then declaration order; the first hit is reported. Nothing
-// is scanned beyond the target when no row is selected.
+// Scans the target to select rows, through the index when the WHERE has a key
+// range, then scans each referencing child table once. The selected rows are
+// checked in scan order and the references in catalog order and then
+// declaration order; the first hit is reported. Nothing is scanned beyond the
+// target when no row is selected.
 PlanMutationResult PlanDelete(const domain::DeleteNode& delete_node,
                               const domain::ICatalog& catalog,
-                              const ITableReader& reader) {
+                              const ITableReader& reader,
+                              const IIndexReader* index_reader) {
   std::optional<TableSchema> found = catalog.FindTable(delete_node.table);
   if (!found.has_value()) {
     return UnknownTableError(delete_node.table);
@@ -822,7 +928,8 @@ PlanMutationResult PlanDelete(const domain::DeleteNode& delete_node,
   const TableSchema& schema = *found;
 
   RowSelector selector(delete_node.predicate.get(), {});
-  if (auto error = ScanRows(reader, schema.name, &selector)) {
+  if (auto error = ScanWhereRows(reader, index_reader, schema.name,
+                                 delete_node.predicate.get(), &selector)) {
     return std::move(*error);
   }
   std::vector<StoredRow> selected = selector.TakeSelected();
@@ -871,15 +978,16 @@ PlanMutationResult PlanDelete(const domain::DeleteNode& delete_node,
 
 PlanMutationResult PlanMutation(const domain::PlanNode& plan,
                                 const domain::ICatalog& catalog,
-                                const ITableReader& reader) {
+                                const ITableReader& reader,
+                                const IIndexReader* index_reader) {
   if (const auto* insert = std::get_if<domain::InsertNode>(&plan.node)) {
-    return PlanInsert(*insert, catalog, reader);
+    return PlanInsert(*insert, catalog, reader, index_reader);
   }
   if (const auto* update = std::get_if<domain::UpdateNode>(&plan.node)) {
-    return PlanUpdate(*update, catalog, reader);
+    return PlanUpdate(*update, catalog, reader, index_reader);
   }
   if (const auto* delete_node = std::get_if<domain::DeleteNode>(&plan.node)) {
-    return PlanDelete(*delete_node, catalog, reader);
+    return PlanDelete(*delete_node, catalog, reader, index_reader);
   }
   return MakeExecutionError(ErrorKind::kUnsupported, "not a write plan node");
 }

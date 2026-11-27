@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -162,6 +163,7 @@ std::variant<std::vector<std::string>, ExecutionError> ReadHeader(
                      ": malformed header");
   }
   std::vector<std::string> names = *lines[0].fields;
+  std::unordered_set<std::string> lowered_names;
   for (std::size_t i = 0; i < names.size(); ++i) {
     if (!IsIdentifier(names[i])) {
       return BindError("invalid column name '" + names[i] +
@@ -172,11 +174,8 @@ std::variant<std::vector<std::string>, ExecutionError> ReadHeader(
       return BindError("invalid column name '" + names[i] +
                        "' in the header; it is a reserved word");
     }
-    for (std::size_t earlier = 0; earlier < i; ++earlier) {
-      if (ToLower(names[earlier]) == ToLower(names[i])) {
-        return BindError("column '" + names[i] +
-                         "' appears twice in the header");
-      }
+    if (!lowered_names.insert(ToLower(names[i])).second) {
+      return BindError("column '" + names[i] + "' appears twice in the header");
     }
   }
   return names;

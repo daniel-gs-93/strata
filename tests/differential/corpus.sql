@@ -262,3 +262,45 @@ CREATE TABLE child (id INT PRIMARY KEY, parent_id INT REFERENCES parent(id));
 ALTER TABLE child ADD COLUMN note TEXT;
 -- differs: DROP of a referenced table
 DROP TABLE parent;
+
+-- Reads by key: a key that is present and one that is absent, ranges, the ends
+-- of the key range, a DOUBLE bound, and the same reads after an update that
+-- grows a row, a delete and an insert of the same key, ADD COLUMN, and DROP
+-- TABLE with the table created again. A paged table reads these through its
+-- index.
+CREATE TABLE keyed (id INT PRIMARY KEY, label TEXT NOT NULL, n INT NOT NULL);
+INSERT INTO keyed VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40), (5, 'e', 50), (6, 'f', 60);
+SELECT id, label FROM keyed WHERE id = 3;
+SELECT id, label FROM keyed WHERE id = 99;
+-- order: total
+SELECT id, n FROM keyed WHERE id >= 2 AND id < 5 ORDER BY id;
+-- order: total
+SELECT id FROM keyed WHERE id < 3 ORDER BY id;
+-- order: total
+SELECT id FROM keyed WHERE id > 4 ORDER BY id;
+SELECT id FROM keyed WHERE id = 0;
+SELECT id FROM keyed WHERE id = -1;
+-- order: total
+SELECT id FROM keyed WHERE id < 2.5 ORDER BY id;
+UPDATE keyed SET label = 'a label that is much longer than the one it replaces, so that the row grows' WHERE id = 3;
+SELECT id, label FROM keyed WHERE id = 3;
+-- order: total
+SELECT id FROM keyed WHERE id >= 3 ORDER BY id;
+DELETE FROM keyed WHERE id = 4;
+SELECT id FROM keyed WHERE id = 4;
+INSERT INTO keyed VALUES (4, 'd2', 41);
+SELECT id, label, n FROM keyed WHERE id = 4;
+ALTER TABLE keyed ADD COLUMN extra INT NOT NULL DEFAULT 7;
+SELECT id, extra FROM keyed WHERE id = 6;
+-- order: total
+SELECT id, extra FROM keyed WHERE id <= 2 ORDER BY id;
+DROP TABLE keyed;
+CREATE TABLE keyed (id INT PRIMARY KEY, label TEXT NOT NULL, n INT NOT NULL);
+INSERT INTO keyed VALUES (5, 'x', 1), (2, 'y', 2);
+SELECT id, label FROM keyed WHERE id = 2;
+-- order: total
+SELECT id FROM keyed WHERE id >= 3 ORDER BY id;
+UPDATE keyed SET n = n + 1 WHERE id = 5;
+DELETE FROM keyed WHERE id > 4;
+-- order: total
+SELECT id, n FROM keyed ORDER BY id;

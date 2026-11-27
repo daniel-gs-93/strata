@@ -799,14 +799,18 @@ TEST(test_cli_bad_arguments_print_usage_and_exit_with_status_two) {
       RunCliWithArguments(work.path(), "a --bogus", {".tables"});
   CliRun option_first =
       RunCliWithArguments(work.path(), "--parallel", {".tables"});
+  // A single-dash word is an option too, not a directory to create.
+  CliRun short_option = RunCliWithArguments(work.path(), "-h", {".tables"});
 
-  for (const CliRun* run : {&too_many, &bad_option, &option_first}) {
+  for (const CliRun* run :
+       {&too_many, &bad_option, &option_first, &short_option}) {
     CHECK_EQ(run->status, 2);
     CHECK_EQ(run->error_text,
              std::string("usage: strata_cli [<directory> [--parallel]]\n"));
     CHECK(run->output.empty());
   }
   CHECK(!std::filesystem::exists(work.path() / "a"));
+  CHECK(!std::filesystem::exists(work.path() / "-h"));
 }
 
 TEST(test_cli_import_loads_courses_and_enrollments) {

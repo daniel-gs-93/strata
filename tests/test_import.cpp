@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -435,6 +436,32 @@ TEST(test_import_handles_header_only_and_empty_input) {
 }
 
 // ---- Integration ------------------------------------------------------------
+
+TEST(test_import_checks_a_wide_header_in_linear_time) {
+  // A header of 60000 names costs tens of seconds when each name is compared
+  // with every earlier one, and milliseconds when the names are looked up in a
+  // set.
+  constexpr std::size_t kColumnCount = 60000;
+  constexpr double kSecondsLimit = 2.0;
+  Cells header = {"id"};
+  for (std::size_t column = 1; column < kColumnCount; ++column) {
+    header.push_back("c" + std::to_string(column));
+  }
+  Cells repeated = header;
+  repeated.back() = "C5";  // the same name as c5, in the other case
+  const domain::ImportRequest request = Request("wide.csv");
+
+  const auto start = std::chrono::steady_clock::now();
+  Inferred unique_names = Infer(request, Table(header, {}));
+  Inferred repeated_names = Infer(request, Table(repeated, {}));
+  const std::chrono::duration<double> elapsed =
+      std::chrono::steady_clock::now() - start;
+
+  CHECK(!Contains(unique_names.error, "appears twice"));
+  CHECK(!Contains(unique_names.error, "invalid column name"));
+  CHECK(Contains(repeated_names.error, "column 'C5' appears twice"));
+  CHECK(elapsed.count() < kSecondsLimit);
+}
 
 TEST(test_service_import_creates_table_and_round_trips_bytes) {
   TempDir db;

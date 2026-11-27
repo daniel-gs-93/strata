@@ -1070,10 +1070,16 @@ bool RunScratchCycle(EquivalenceRunner* runner, const std::string& table) {
   return true;
 }
 
+// "ok", or the message of the first violation Database::CheckIndex found.
+std::string IndexCheckText(const paged::Status& status) {
+  return status.has_value() ? status->message : "ok";
+}
+
 struct RandomRun {
   std::uint64_t seed;
   ReplacementPolicyKind policy;
   std::size_t frames;
+  std::size_t key_percent;  // the share of key statements (0 for none)
 };
 
 // The setup, then kStatementsPerSeed generated statements, compared one by one.
@@ -1092,7 +1098,7 @@ void RunRandomStatements(const RandomRun& run) {
       return;
     }
   }
-  StatementGenerator generator(run.seed);
+  StatementGenerator generator(run.seed, run.key_percent);
   Outcomes outcomes;
   for (std::size_t i = 0; i < kStatementsPerSeed; ++i) {
     if (i % kStatementsPerScratchCycle == 0 &&
@@ -1109,6 +1115,25 @@ void RunRandomStatements(const RandomRun& run) {
     if (!RUN_EQUIVALENT(runner, "SELECT * FROM " + schema.name)) {
       return;
     }
+  }
+
+  if (run.key_percent > 0) {
+    // The index of every table agrees with its rows after the whole stream,
+    // and no pin is left.
+    paged::PagedEngine& engine = *pair.paged.engine;
+    for (const std::string& table : engine.Catalog().TableNames()) {
+      CHECK_EQ(IndexCheckText(engine.database().CheckIndex(table)),
+               std::string("ok"));
+    }
+    CHECK_EQ(engine.database().buffer().PinnedFrameCount(), std::size_t{0});
+    // Key statements keep the tables populated, read rows, match no row and
+    // change rows.
+    CHECK(outcomes.selects_with_rows >= 300);
+    CHECK(outcomes.selects_without_rows >= 40);
+    CHECK(outcomes.writes_applied >= 150);
+    CHECK(outcomes.writes_matching_no_row >= 30);
+    CHECK_EQ(outcomes.other_errors, std::size_t{0});
+    return;
   }
 
   // A stream that stopped reaching the rules (every statement failing to bind,
@@ -1150,9 +1175,270 @@ TEST(test_equivalence_known_differences_are_as_documented) {
 }
 
 TEST(test_equivalence_randomized_statements_match) {
-  RunRandomStatements({20260101, ReplacementPolicyKind::kLru, 4});
-  RunRandomStatements({20260202, ReplacementPolicyKind::kTwoQ, 4});
-  RunRandomStatements({20260303, ReplacementPolicyKind::kLru, 16});
+  RunRandomStatements({20260101, ReplacementPolicyKind::kLru, 4, 0});
+  RunRandomStatements({20260202, ReplacementPolicyKind::kTwoQ, 4, 0});
+  RunRandomStatements({20260303, ReplacementPolicyKind::kLru, 16, 0});
+}
+
+namespace {
+
+// FetchPage calls made by the paged engine since the last ResetStats.
+std::uint64_t FetchPageCount(paged::BufferManager& buffer) {
+  const paged::BufferStats stats = buffer.Stats();
+  return stats.hits + stats.misses;
+}
+
+// A table of more than 20 pages: a point SELECT of an existing key reads at
+// most 2 index pages and 1 heap page, whatever the pool size, where a scan
+// reads every page of the table.
+void CheckPointLookupCost(ReplacementPolicyKind policy, std::size_t frames) {
+  EnginePair pair;
+  if (!OpenPair(&pair, frames, policy)) {
+    return;
+  }
+  EquivalenceRunner runner(*pair.flatfile, *pair.paged.service,
+                           std::string("point lookups, ") + PolicyName(policy) +
+                               ", " + std::to_string(frames) + " frames");
+  if (!RUN_EQUIVALENT(runner,
+                      "CREATE TABLE wide (id INT PRIMARY KEY, pad TEXT)")) {
+    return;
+  }
+  const std::string pad = "'" + std::string(400, 'p') + "'";
+  constexpr int kRows = 300;
+  constexpr int kRowsPerInsert = 30;
+  for (int first = 1; first <= kRows; first += kRowsPerInsert) {
+    std::string sql = "INSERT INTO wide VALUES ";
+    for (int id = first; id < first + kRowsPerInsert; ++id) {
+      sql += (id > first ? ", (" : "(") + std::to_string(id) + ", " + pad + ")";
+    }
+    if (!RUN_EQUIVALENT(runner, sql)) {
+      return;
+    }
+  }
+  paged::BufferManager& buffer = pair.paged.engine->database().buffer();
+  CHECK(buffer.PageCount() > 20);
+  constexpr int kLookups = 20;
+  for (int lookup = 0; lookup < kLookups; ++lookup) {
+    const int id = 1 + lookup * (kRows / kLookups) + lookup % 7;
+    buffer.ResetStats();
+    if (!RUN_EQUIVALENT(
+            runner, "SELECT id FROM wide WHERE id = " + std::to_string(id))) {
+      return;
+    }
+    CHECK(FetchPageCount(buffer) <= 3);
+    CHECK_EQ(
+        std::get<domain::ResultSet>(runner.last_paged_result()).rows.size(),
+        std::size_t{1});
+  }
+  // The same statement without a key range reads the whole table.
+  buffer.ResetStats();
+  if (!RUN_EQUIVALENT(runner, "SELECT id FROM wide WHERE id + 0 = 5")) {
+    return;
+  }
+  CHECK(FetchPageCount(buffer) > 20);
+}
+
+}  // namespace
+
+TEST(test_equivalence_generated_key_predicates_match_flatfile) {
+  RunRandomStatements({20261101, ReplacementPolicyKind::kLru, 4, 60});
+  RunRandomStatements({20261102, ReplacementPolicyKind::kTwoQ, 4, 60});
+  RunRandomStatements({20261103, ReplacementPolicyKind::kLru, 16, 60});
+  CheckPointLookupCost(ReplacementPolicyKind::kLru, 16);
+  CheckPointLookupCost(ReplacementPolicyKind::kTwoQ, 4);
+}
+
+// ----------------------------------------------------------------------------
+// The corpus of key predicates.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// A TEXT literal of `length` characters that starts with `head`.
+std::string PaddedText(const std::string& head, std::size_t length) {
+  return "'" + head + std::string(length - head.size(), 'p') + "'";
+}
+
+// The table `ix` with 8 rows of 450-character labels, which fill its first
+// page, and the 8 key SELECTs that every phase of the corpus repeats.
+std::vector<std::string> BuildIndexCorpusStart() {
+  std::vector<std::string> corpus = {
+      "CREATE TABLE ix (id INT PRIMARY KEY, label TEXT, n INT)",
+      "INSERT INTO ix VALUES (1, " + PaddedText("a", 450) + ", 10), (2, " +
+          PaddedText("b", 450) + ", 20), (3, " + PaddedText("c", 450) +
+          ", 30), (4, " + PaddedText("d", 450) + ", 40), (5, " +
+          PaddedText("e", 450) + ", 50), (6, " + PaddedText("f", 450) +
+          ", 60), (7, " + PaddedText("g", 450) + ", 70), (8, " +
+          PaddedText("h", 450) + ", 80)"};
+  return corpus;
+}
+
+void AppendKeySelects(std::vector<std::string>* corpus) {
+  corpus->push_back("SELECT id, n FROM ix WHERE id = 3");
+  corpus->push_back("SELECT n FROM ix WHERE 6 = id");
+  corpus->push_back("SELECT id FROM ix WHERE id > 2 AND id <= 5 ORDER BY id");
+  corpus->push_back("SELECT id, n FROM ix WHERE id < 4");
+  corpus->push_back("SELECT id, n FROM ix WHERE id >= 7");
+  corpus->push_back("SELECT id FROM ix WHERE id = 3 OR id = 7");
+  corpus->push_back("SELECT id, n FROM ix WHERE id = 5 AND n > 0");
+  corpus->push_back("SELECT id, n FROM ix WHERE id = 99");
+}
+
+// The statements after the first page of the corpus: an UPDATE that grows a
+// label so that its row moves to another page, a delete and an insert of the
+// same key, ADD COLUMN, a DROP TABLE with the table created again, and key
+// literals at the edges of the INT range.
+std::vector<std::string> BuildIndexCorpusRest() {
+  std::vector<std::string> corpus;
+  corpus.push_back("UPDATE ix SET label = " + PaddedText("moved", 900) +
+                   " WHERE id = 3");
+  corpus.push_back("UPDATE ix SET n = n + 1 WHERE id >= 6 AND id <= 7");
+  AppendKeySelects(&corpus);
+  corpus.push_back("DELETE FROM ix WHERE id = 5");
+  corpus.push_back("INSERT INTO ix VALUES (5, 'e2', 55)");
+  corpus.push_back("DELETE FROM ix WHERE id > 7");
+  corpus.push_back("INSERT INTO ix VALUES (9, 'i', 90), (8, 'h2', 81)");
+  AppendKeySelects(&corpus);
+  corpus.push_back("ALTER TABLE ix ADD COLUMN extra INT DEFAULT 1");
+  corpus.push_back("UPDATE ix SET extra = id * 2 WHERE id >= 6");
+  corpus.push_back("DELETE FROM ix WHERE id = 2");
+  AppendKeySelects(&corpus);
+  const std::vector<std::string> recreated = {
+      "DROP TABLE ix",
+      "CREATE TABLE ix (id INT PRIMARY KEY, label TEXT, n INT)",
+      "INSERT INTO ix VALUES (3, 'z', 1), (1, 'y', 2), (2, 'x', 3)",
+      "SELECT * FROM ix WHERE id = 3",
+      "SELECT * FROM ix WHERE id <= 2",
+      "DELETE FROM ix WHERE id = 1",
+      "UPDATE ix SET n = n + 1 WHERE id >= 2",
+      "SELECT * FROM ix WHERE id >= 0",
+      "SELECT * FROM ix WHERE id <> 3",
+      "INSERT INTO ix VALUES (-9223372036854775808, 'lo', 0), "
+      "(9223372036854775807, 'hi', 0)",
+      "SELECT id FROM ix WHERE id = -1",
+      "SELECT id FROM ix WHERE id < 9223372036854775807",
+      "SELECT id FROM ix WHERE id > -1",
+      "SELECT id FROM ix WHERE id >= 9223372036854775807",
+      "SELECT id FROM ix WHERE id <= -9223372036854775808",
+      "SELECT id FROM ix WHERE id > 1 AND id < 2",
+      "UPDATE ix SET n = 0 WHERE id = 9223372036854775807"};
+  corpus.insert(corpus.end(), recreated.begin(), recreated.end());
+  return corpus;
+}
+
+// A conjunct that fails comes before the key conjunct. Flatfile reads every
+// row, meets the row with id 3 and reports the error; paged reads only the
+// rows of the key range and returns what the predicate keeps there (ADR-0052).
+void CheckErrorBeforeKeyDifference(EnginePair* pair) {
+  struct Case {
+    const char* key_conjunct;
+    std::vector<std::string> paged_ids;
+  };
+  const Case cases[] = {
+      {"id = 5", {"5"}}, {"id = 4", {"4"}}, {"id >= 6", {"6", "7", "8"}},
+      {"id < 3", {}},    {"id = 99", {}},   {"7 = id", {"7"}}};
+  for (const Case& test_case : cases) {
+    const BothResults results = RunBoth(
+        pair, std::string("SELECT id FROM ix WHERE 10 / (id - 3) > 0 AND ") +
+                  test_case.key_conjunct);
+    ExpectError(results.flatfile, ErrorKind::kRuntime, "division by zero");
+    CHECK_EQ(FirstColumn(results.paged), test_case.paged_ids);
+  }
+}
+
+// The statements that have no difference run through the comparator; the
+// phase of the UPDATE that moves a row is checked to have grown the file.
+void RunIndexCorpus(ReplacementPolicyKind policy) {
+  EnginePair pair;
+  if (!OpenPair(&pair, 4, policy)) {
+    return;
+  }
+  EquivalenceRunner runner(*pair.flatfile, *pair.paged.service,
+                           std::string("index corpus, ") + PolicyName(policy));
+  std::vector<std::string> start = BuildIndexCorpusStart();
+  AppendKeySelects(&start);
+  const std::vector<std::string> rest = BuildIndexCorpusRest();
+  CHECK_EQ(start.size() + rest.size(), std::size_t{60});
+  for (const std::string& sql : start) {
+    if (!RUN_EQUIVALENT(runner, sql)) {
+      return;
+    }
+  }
+  CheckErrorBeforeKeyDifference(&pair);
+  paged::BufferManager& buffer = pair.paged.engine->database().buffer();
+  for (const std::string& sql : rest) {
+    const bool is_moving_update = sql.starts_with("UPDATE ix SET label");
+    const paged::PageId pages_before = buffer.PageCount();
+    if (!RUN_EQUIVALENT(runner, sql)) {
+      return;
+    }
+    if (is_moving_update) {
+      CHECK(buffer.PageCount() > pages_before);
+    }
+  }
+  CHECK_EQ(IndexCheckText(pair.paged.engine->database().CheckIndex("ix")),
+           std::string("ok"));
+  CHECK_EQ(buffer.PinnedFrameCount(), std::size_t{0});
+}
+
+// A table of 1000 keys in 7 leaves whose first leaf and last leaf are emptied
+// by deletes (a delete frees no node), read through ranges with and without a
+// low bound, then filled again, then emptied altogether.
+void RunEmptiedLeaves(ReplacementPolicyKind policy) {
+  EnginePair pair;
+  if (!OpenPair(&pair, 4, policy)) {
+    return;
+  }
+  EquivalenceRunner runner(
+      *pair.flatfile, *pair.paged.service,
+      std::string("emptied leaves, ") + PolicyName(policy));
+  std::vector<std::string> statements = {
+      "CREATE TABLE leaves (id INT PRIMARY KEY, v INT)"};
+  for (int first = 1; first <= 1000; first += 500) {
+    std::string insert = "INSERT INTO leaves VALUES ";
+    for (int id = first; id < first + 500; ++id) {
+      insert += (id > first ? ", (" : "(") + std::to_string(id) + ", 0)";
+    }
+    statements.push_back(insert);
+  }
+  const std::vector<std::string> reads = {
+      "SELECT COUNT(*) FROM leaves",
+      "SELECT id FROM leaves WHERE id < 400 ORDER BY id LIMIT 3",
+      "SELECT id FROM leaves WHERE id >= 700 ORDER BY id LIMIT 3",
+      "SELECT COUNT(*) FROM leaves WHERE id > 100",
+      "SELECT COUNT(*) FROM leaves WHERE id <= 5000",
+      "SELECT id FROM leaves WHERE id >= 900",
+      "SELECT id FROM leaves WHERE id = 5",
+      "SELECT id FROM leaves WHERE id = 870"};
+  statements.push_back("DELETE FROM leaves WHERE id <= 160");
+  statements.push_back("DELETE FROM leaves WHERE id >= 850");
+  statements.insert(statements.end(), reads.begin(), reads.end());
+  statements.push_back(
+      "INSERT INTO leaves VALUES (1, 1), (2, 2), (900, 900), (1000, 1000)");
+  statements.insert(statements.end(), reads.begin(), reads.end());
+  statements.push_back("DELETE FROM leaves");
+  statements.push_back("SELECT COUNT(*) FROM leaves WHERE id > 0");
+  statements.push_back("SELECT id FROM leaves WHERE id < 5");
+  statements.push_back("INSERT INTO leaves VALUES (7, 7)");
+  statements.push_back("SELECT id FROM leaves WHERE id < 100");
+  for (const std::string& sql : statements) {
+    if (!RUN_EQUIVALENT(runner, sql)) {
+      return;
+    }
+  }
+  CHECK_EQ(IndexCheckText(pair.paged.engine->database().CheckIndex("leaves")),
+           std::string("ok"));
+  CHECK_EQ(pair.paged.engine->database().buffer().PinnedFrameCount(),
+           std::size_t{0});
+}
+
+}  // namespace
+
+TEST(test_equivalence_corpus_with_index_predicates) {
+  RunIndexCorpus(ReplacementPolicyKind::kLru);
+  RunIndexCorpus(ReplacementPolicyKind::kTwoQ);
+  RunEmptiedLeaves(ReplacementPolicyKind::kLru);
+  RunEmptiedLeaves(ReplacementPolicyKind::kTwoQ);
 }
 
 }  // namespace strata::testing

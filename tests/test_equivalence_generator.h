@@ -41,9 +41,19 @@ const std::vector<std::string>& EquivalenceSetupStatements();
 //     DOUBLE or over INT values near the 64-bit limit, no -0.0 in a stored
 //     cell (see DoublePool), and no ALTER TABLE, DROP TABLE or table named
 //     sys_*.
+//
+// key_percent is the share of statements that are drawn from the key
+// statements instead: a SELECT, UPDATE or DELETE whose WHERE compares the INT
+// primary key `id` of visitors, stories or reactions with literals (equality
+// with the literal on either side, one-sided and two-sided ranges, zero,
+// negative and 64-bit boundary literals, <>, OR, a DOUBLE literal, a non-key
+// conjunct). An UPDATE of such a statement writes a column that no key, UNIQUE
+// column or foreign key involves, and a DELETE of a referenced table selects at
+// most one row, so the rule above still holds. With key_percent 0 the stream
+// is the one without key statements.
 class StatementGenerator {
  public:
-  explicit StatementGenerator(std::uint64_t seed);
+  explicit StatementGenerator(std::uint64_t seed, std::size_t key_percent = 0);
 
   // The next statement. tables is the current content of every table (the
   // flat-file engine's, from EquivalenceRunner::flatfile_tables), which lets a
@@ -113,7 +123,18 @@ class StatementGenerator {
   std::string UpdateSwapColumns();
   std::string Delete();
 
+  // Key statements (see the class comment).
+  std::string KeyLiteral(const std::string& table);
+  std::string KeyPredicate(const std::string& table);
+  std::string NarrowKeyPredicate(const std::string& table);
+  std::string SingleKeyPredicate(const std::string& table);
+  std::string KeySelect(const std::string& table);
+  std::string KeyUpdate(const std::string& table);
+  std::string KeyDelete(const std::string& table);
+  std::string KeyStatement();
+
   std::mt19937_64 engine_;
+  std::size_t key_percent_;
   const TableContents* tables_ = nullptr;
   Risk risk_ = Risk::kNone;
   std::size_t next_name_number_ = 0;

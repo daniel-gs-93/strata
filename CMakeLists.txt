@@ -28,11 +28,14 @@ add_library(strata_core STATIC
         src/flat_file_executor.cpp
         src/import_inference.cpp
         src/infrastructure.cpp
+        src/paged/btree.cpp
+        src/paged/btree_node.cpp
         src/paged/buffer_manager.cpp
         src/paged/catalog.cpp
         src/paged/crc32c.cpp
         src/paged/database.cpp
         src/paged/heap_access.cpp
+        src/paged/key_range.cpp
         src/paged/mutation_planner.cpp
         src/paged/operators.cpp
         src/paged/page_allocator.cpp
@@ -75,6 +78,8 @@ add_executable(strata_tests
         tests/test_import.cpp
         tests/test_layering.cpp
         tests/test_paged_allocator.cpp
+        tests/test_paged_btree.cpp
+        tests/test_paged_btree_node.cpp
         tests/test_paged_buffer.cpp
         tests/test_paged_catalog.cpp
         tests/test_paged_database.cpp
@@ -103,3 +108,21 @@ target_compile_definitions(strata_tests PRIVATE
         STRATA_CLI_PATH="$<TARGET_FILE:strata_cli>")
 add_dependencies(strata_tests strata_cli)
 add_test(NAME strata_tests COMMAND strata_tests)
+
+# The SQLite differential harness is Python and is not built. It is registered
+# only when an interpreter that can run it (3.10 or later) is found.
+find_package(Python3 3.10 COMPONENTS Interpreter)
+if(Python3_FOUND)
+    add_test(NAME differential
+             COMMAND ${Python3_EXECUTABLE} -I tests/differential/differential.py
+                     --cli $<TARGET_FILE:strata_cli>
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(NAME differential_unit
+             COMMAND ${Python3_EXECUTABLE} -I -m unittest discover
+                     -s tests/differential -p "test_*.py"
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(differential differential_unit PROPERTIES
+            ENVIRONMENT "STRATA_CLI_PATH=$<TARGET_FILE:strata_cli>")
+else()
+    message(STATUS "Python3 not found: the differential tests are not registered")
+endif()

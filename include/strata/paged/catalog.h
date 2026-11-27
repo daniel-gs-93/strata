@@ -20,7 +20,9 @@
 // The schemas of the user tables, stored in two system tables inside the same
 // database file (design document 2.6, ADR-0032): sys_tables (table id 1) and
 // sys_columns (table id 2). The catalog reads them once into an in-memory
-// cache, so FindTable is O(1) plus a copy of the schema.
+// cache, so FindTable is O(1) plus a copy of the schema. A table whose primary
+// key is an INT also has an index, and its sys_tables row records the page id
+// of the root (index_root, ADR-0048); 0 means no index.
 //
 // FindTable, TableNames, TableId and FirstPage may be called from several
 // threads at once; the cache is guarded by a shared_mutex. CreateTable,
@@ -47,12 +49,14 @@ class Catalog : public domain::ICatalog {
   // checks.
   Status Load();
 
-  // Adds a table: validates schema, writes the table's first page and its rows
-  // in the system tables, advances next_table_id, and then updates the cache.
-  // There is no transaction: when a step fails the rows already written are
-  // deleted (best effort) and the first error is returned; the new table's
-  // first page stays allocated. kAlreadyExists: the name is taken (compared
-  // case-insensitively). kInvalidArgument: any other rule of 2.6 is violated.
+  // Adds a table: validates schema, allocates the table's first page and, for
+  // an INT primary key, the root of its index (an empty leaf), writes the rows
+  // in the system tables with both page ids in the sys_tables row, advances
+  // next_table_id, and then updates the cache. There is no transaction: when a
+  // step fails the rows already written are deleted (best effort) and the
+  // first error is returned; the new table's pages stay allocated.
+  // kAlreadyExists: the name is taken (compared case-insensitively).
+  // kInvalidArgument: any other rule of 2.6 is violated.
   PageResult<domain::TableSchema> CreateTable(
       const domain::TableSchema& schema);
 
@@ -66,14 +70,16 @@ class Catalog : public domain::ICatalog {
 
   // ADD COLUMN, last step: adds the sys_columns row at the next position,
   // points the table's sys_tables row at new_first_page, which holds the rows
-  // already copied with the new schema, and updates the cache. The errors
-  // are those of CheckAddColumn, and kCorrupt when sys_tables has no row for
-  // the table. When the second write fails the first is deleted (best
-  // effort) and the message ends with `; undoing the rows also failed: ...`
-  // if that fails too. The table's old pages are not touched.
+  // already copied with the new schema, and at new_index_root, the root of the
+  // tree built beside it (0 for a table without an index), in one row update,
+  // and updates the cache. The errors are those of CheckAddColumn, and
+  // kCorrupt when sys_tables has no row for the table. When the second write
+  // fails the first is deleted (best effort) and the message ends with
+  // `; undoing the rows also failed: ...` if that fails too. The table's old
+  // pages are not touched.
   Status CommitAddColumn(const std::string& table,
-                         const domain::ColumnDef& column,
-                         PageId new_first_page);
+                         const domain::ColumnDef& column, PageId new_first_page,
+                         PageId new_index_root);
 
   // Deletes the sys_columns rows and the sys_tables row of the table and
   // removes it from the cache. Its table id is not used again. The table's
@@ -91,12 +97,17 @@ class Catalog : public domain::ICatalog {
 
   std::optional<std::uint32_t> TableId(const std::string& name) const;
   std::optional<PageId> FirstPage(const std::string& name) const;
+  // The root page of the table's index. No value when the table is unknown or
+  // has no index (its index_root is 0).
+  std::optional<PageId> IndexRoot(const std::string& name) const;
 
  private:
   struct Entry {
     std::uint32_t table_id;
     domain::TableSchema schema;
     PageId first_page;
+    // 0 when the table has no index.
+    PageId index_root;
   };
 
   // Undoes the rows of a failed CreateTable; returns the message to append to

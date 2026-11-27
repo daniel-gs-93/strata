@@ -465,6 +465,15 @@ std::string Suggestion(const std::string& name,
   const std::string* best = nullptr;
   std::size_t best_distance = kMaxSuggestionDistance + 1;
   for (const std::string& candidate : candidates) {
+    // The distance is at least the difference of the lengths, so a candidate
+    // that differs by more than kMaxSuggestionDistance cannot be suggested and
+    // needs no edit-distance table.
+    const std::size_t length_gap = name.size() > candidate.size()
+                                       ? name.size() - candidate.size()
+                                       : candidate.size() - name.size();
+    if (length_gap > kMaxSuggestionDistance) {
+      continue;
+    }
     const std::size_t distance = EditDistance(name, candidate);
     if (distance == 0 || distance >= best_distance) {
       continue;

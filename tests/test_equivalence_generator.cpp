@@ -221,7 +221,9 @@ const std::vector<std::string>& EquivalenceSetupStatements() {
 // Randomness and values that exist.
 // ----------------------------------------------------------------------------
 
-StatementGenerator::StatementGenerator(std::uint64_t seed) : engine_(seed) {}
+StatementGenerator::StatementGenerator(std::uint64_t seed,
+                                       std::size_t key_percent)
+    : engine_(seed), key_percent_(key_percent) {}
 
 std::size_t StatementGenerator::Below(std::size_t bound) {
   return static_cast<std::size_t>(engine_() % bound);
@@ -1176,12 +1178,187 @@ std::string StatementGenerator::Delete() {
 }
 
 // ----------------------------------------------------------------------------
+// Key statements.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// The columns of a table with an INT primary key `id` that a key statement
+// reads and writes. None is a key, a UNIQUE column or a foreign key.
+struct NonKeyColumns {
+  const char* selected;        // read next to id
+  const char* conjuncts[2];    // predicates over non-key columns
+  const char* numeric_update;  // an assignment that adds to a column
+  const char* text_column;     // a TEXT column that an UPDATE rewrites
+};
+
+NonKeyColumns NonKeyColumnsOf(const std::string& table) {
+  if (table == "visitors") {
+    return {"location",
+            {"location = 'Paris'", "rating >= 3.0"},
+            "rating = rating + 1.0",
+            "location"};
+  }
+  if (table == "stories") {
+    return {"views",
+            {"views > 3", "content = 'hello world'"},
+            "views = views + 1",
+            "content"};
+  }
+  return {"type",
+          {"type = 'like'", "weight < 2.0"},
+          "timestamp = timestamp + 1",
+          "type"};
+}
+
+}  // namespace
+
+// A literal to compare the key with: a key that exists, one beside it, zero, a
+// negative number or the largest INT.
+std::string StatementGenerator::KeyLiteral(const std::string& table) {
+  switch (Below(9)) {
+    case 0:
+      return "0";
+    case 1:
+      return "-1";
+    case 2:
+      return "9223372036854775807";
+    case 3:
+      return std::to_string(ExistingOrNewId(table) + 1);
+    case 4:
+      return std::to_string(ExistingOrNewId(table) - 1);
+    default:
+      return std::to_string(ExistingOrNewId(table));
+  }
+}
+
+// Any predicate over the key: it may select every row, one row or none.
+std::string StatementGenerator::KeyPredicate(const std::string& table) {
+  static const std::vector<std::string> double_literals = {"2.5", "3.0",
+                                                           "-1.5"};
+  const std::string low = KeyLiteral(table);
+  const std::string high = KeyLiteral(table);
+  switch (Below(12)) {
+    case 0:
+      return "id = " + low;
+    case 1:
+      return low + " = id";
+    case 2:
+      return "id < " + low;
+    case 3:
+      return low + " < id";
+    case 4:
+      return "id <= " + low;
+    case 5:
+      return "id >= " + low;
+    case 6:
+      return "id >= " + low + " AND id <= " + high;
+    case 7:
+      return "id > " + low + " AND id < " + high;
+    case 8:
+      return "id <> " + low;
+    case 9:
+      return "id = " + low + " OR id = " + high;
+    case 10:
+      return "id = " + PickText(double_literals);
+    default:
+      return "id >= " + low + " AND " +
+             NonKeyColumnsOf(table).conjuncts[Below(2)];
+  }
+}
+
+// A predicate that selects at most a few rows.
+std::string StatementGenerator::NarrowKeyPredicate(const std::string& table) {
+  const std::string literal = KeyLiteral(table);
+  switch (Below(5)) {
+    case 0:
+      return "id = " + literal;
+    case 1:
+      return literal + " = id";
+    case 2: {
+      const std::int64_t first = ExistingOrNewId(table);
+      return "id >= " + std::to_string(first) +
+             " AND id <= " + std::to_string(first + 2);
+    }
+    case 3:
+      return "id = " + literal + " OR id = " + KeyLiteral(table);
+    default:
+      return "id = " + literal + " AND " +
+             NonKeyColumnsOf(table).conjuncts[Below(2)];
+  }
+}
+
+// A predicate that selects at most one row: an equality on the key.
+std::string StatementGenerator::SingleKeyPredicate(const std::string& table) {
+  const std::string literal = KeyLiteral(table);
+  switch (Below(3)) {
+    case 0:
+      return "id = " + literal;
+    case 1:
+      return literal + " = id";
+    default:
+      return "id = " + literal + " AND " +
+             NonKeyColumnsOf(table).conjuncts[Below(2)];
+  }
+}
+
+std::string StatementGenerator::KeySelect(const std::string& table) {
+  if (Chance(30)) {
+    // The order ends with the primary key, so the cut is deterministic.
+    return std::string("SELECT id, ") + NonKeyColumnsOf(table).selected +
+           " FROM " + table + " WHERE " + KeyPredicate(table) +
+           " ORDER BY id LIMIT " + std::to_string(1 + Below(4));
+  }
+  return "SELECT * FROM " + table + " WHERE " + KeyPredicate(table);
+}
+
+// Rewrites a column that no key involves; a long text makes a row grow and
+// move to another page.
+std::string StatementGenerator::KeyUpdate(const std::string& table) {
+  static const std::vector<std::string> texts = {
+      "''", "'x'", "'Paris'", "'" + std::string(300, 'k') + "'"};
+  const NonKeyColumns columns = NonKeyColumnsOf(table);
+  const std::string assignment =
+      Chance(50) ? std::string(columns.numeric_update)
+                 : std::string(columns.text_column) + " = " + PickText(texts);
+  return "UPDATE " + table + " SET " + assignment + " WHERE " +
+         KeyPredicate(table);
+}
+
+// reactions is referenced by nobody, so a DELETE of a few rows cannot fail;
+// the other tables get a DELETE of at most one row, whose RESTRICT error does
+// not depend on the scan order.
+std::string StatementGenerator::KeyDelete(const std::string& table) {
+  if (table == "reactions") {
+    return "DELETE FROM reactions WHERE " + NarrowKeyPredicate(table);
+  }
+  return "DELETE FROM " + table + " WHERE " + SingleKeyPredicate(table);
+}
+
+std::string StatementGenerator::KeyStatement() {
+  static const std::vector<std::string> tables = {"visitors", "stories",
+                                                  "reactions"};
+  const std::string& table = PickText(tables);
+  const std::size_t form = Below(100);
+  if (form < 50) {
+    return KeySelect(table);
+  }
+  if (form < 80) {
+    return KeyUpdate(table);
+  }
+  return KeyDelete(table);
+}
+
+// ----------------------------------------------------------------------------
 // The next statement.
 // ----------------------------------------------------------------------------
 
 std::string StatementGenerator::Next(const TableContents& tables) {
   tables_ = &tables;
   risk_ = Risk::kNone;
+  if (key_percent_ > 0 && Chance(key_percent_)) {
+    return KeyStatement();
+  }
   if (Chance(25)) {
     risk_ = Chance(50) ? Risk::kOverflow : Risk::kDivision;
   }

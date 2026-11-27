@@ -507,8 +507,10 @@ PagedFixture WrapEngine(paged::Database database) {
       std::make_unique<paged::PagedEngine>(std::move(database), nullptr);
   PagedFixture fixture;
   fixture.engine = engine.get();
+  // The engine is also the index inspector, as Bootstrap passes it.
   fixture.service = std::make_unique<application::QueryService>(
-      std::move(engine), std::make_unique<infrastructure::FileCsvSource>());
+      std::move(engine), std::make_unique<infrastructure::FileCsvSource>(),
+      fixture.engine);
   return fixture;
 }
 

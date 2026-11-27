@@ -778,6 +778,29 @@ TEST(test_csv_commit_refuses_symlink) {
   CHECK_EQ(
       ListDirectory(dir.path()),
       "catalog.csv,reactions.csv,real_visitors.csv,stories.csv,visitors.csv");
+
+  // A link where the new content of stories.csv is staged would send the write
+  // to the link's target, which lies outside the database directory.
+  TempDir outside;
+  const std::filesystem::path victim = outside.path() / "victim.txt";
+  WriteFile(victim, "keep\n");
+  const std::string stories_before = ReadFile(dir.path() / "stories.csv");
+  std::filesystem::create_symlink(victim, dir.path() / "stories.csv.temp",
+                                  error);
+  CHECK(!error);
+
+  std::optional<std::string> temp_failure = CommitWrites(
+      *repository,
+      {TableWrite{StoriesSchema(), {StoryRow(10, "hello", "alice", 5)}}});
+
+  CHECK_EQ(DescribeOutcome(temp_failure),
+           "not a regular file: stories.csv.temp");
+  CHECK_EQ(ReadFile(victim), "keep\n");
+  CHECK_EQ(ReadFile(dir.path() / "stories.csv"), stories_before);
+  CHECK(std::filesystem::is_symlink(dir.path() / "stories.csv.temp"));
+  CHECK_EQ(ListDirectory(dir.path()),
+           "catalog.csv,reactions.csv,real_visitors.csv,stories.csv,"
+           "stories.csv.temp,visitors.csv");
 }
 
 TEST(test_csv_commit_preserves_file_permissions) {
@@ -1058,6 +1081,54 @@ TEST(test_csv_commit_drops_table_file_and_catalog_entry) {
   CHECK_EQ(DescribeOutcome(failure), kSuccess);
   CHECK_EQ(ListDirectory(dir.path()), kFixtureAListing);
   CHECK(ReadFile(dir.path() / "catalog.csv").find("measures") ==
+        std::string::npos);
+}
+
+TEST(test_csv_commit_detects_a_changed_catalog_and_a_changed_dropped_table) {
+  const std::string suffix =
+      " changed on disk since it was loaded; run .open "
+      "again";
+  const std::vector<domain::TableSchema> without_measures = {
+      VisitorsSchema(), StoriesSchema(), ReactionsSchema()};
+
+  // catalog.csv changes after the load, and a commit that rewrites it refuses.
+  TempDir catalog_dir;
+  WriteFixtureA(catalog_dir.path());
+  auto catalog_repository = MakeCsvRepository(catalog_dir.path());
+  MustLoad(*catalog_repository);
+  const std::string catalog_changed =
+      ReadFile(catalog_dir.path() / "catalog.csv") + "\n";
+  WriteFile(catalog_dir.path() / "catalog.csv", catalog_changed);
+  CommitSet rewrite;
+  rewrite.catalog = without_measures;
+
+  std::optional<std::string> catalog_failure =
+      catalog_repository->Commit(rewrite);
+
+  CHECK_EQ(DescribeOutcome(catalog_failure), "catalog.csv" + suffix);
+  CHECK_EQ(ReadFile(catalog_dir.path() / "catalog.csv"), catalog_changed);
+
+  // A table to drop changes after the load, and the drop refuses.
+  TempDir drop_dir;
+  WriteFixtureA(drop_dir.path());
+  WriteFile(
+      drop_dir.path() / "catalog.csv",
+      infrastructure::SerializeCatalog({VisitorsSchema(), StoriesSchema(),
+                                        ReactionsSchema(), MeasuresSchema()}));
+  WriteFile(drop_dir.path() / "measures.csv", "id,score\n1,2.5\n");
+  auto drop_repository = MakeCsvRepository(drop_dir.path());
+  MustLoad(*drop_repository);
+  const std::string measures_changed = "id,score\n1,2.5\n2,3.5\n";
+  WriteFile(drop_dir.path() / "measures.csv", measures_changed);
+  CommitSet drop;
+  drop.catalog = without_measures;
+  drop.drops = {"measures"};
+
+  std::optional<std::string> drop_failure = drop_repository->Commit(drop);
+
+  CHECK_EQ(DescribeOutcome(drop_failure), "measures.csv" + suffix);
+  CHECK_EQ(ReadFile(drop_dir.path() / "measures.csv"), measures_changed);
+  CHECK(ReadFile(drop_dir.path() / "catalog.csv").find("measures") !=
         std::string::npos);
 }
 

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <iostream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -263,6 +264,125 @@ TEST(test_paged_environment_alter_and_drop_reuse_pages) {
       if (fetched.ok()) {
         CHECK_OK(SlottedPageView(fetched.value().data()).CheckStructure());
       }
+    }
+  }
+}
+
+namespace {
+
+// Creates the three tables and inserts every row into its heap and its key into
+// its index, in key order, then closes the database.
+void BuildIndexedDatabase(const std::filesystem::path& directory,
+                          const std::vector<ScaleTable>& tables) {
+  auto database = OpenDatabase(directory, ReplacementPolicyKind::kLru);
+  if (database == nullptr) {
+    return;
+  }
+  for (const ScaleTable& table : tables) {
+    CHECK_OK(database->CreateTable(table.schema));
+    auto heap = database->Table(table.schema.name);
+    auto index = database->Index(table.schema.name);
+    CHECK_OK(heap);
+    CHECK_OK(index);
+    if (!heap.ok() || !index.ok() || index.value() == nullptr) {
+      return;
+    }
+    for (const Row& row : table.rows) {
+      auto rid = heap.value()->Insert(row);
+      CHECK_OK(rid);
+      if (!rid.ok()) {
+        return;
+      }
+      CHECK_OK(
+          index.value()->Insert(std::get<std::int64_t>(row[0]), rid.value()));
+    }
+  }
+  CHECK_OK(database->Close());
+}
+
+// The height, the counts and the listed nodes of a tree, as one string, for
+// comparing two shapes.
+std::string ShapeText(const std::string& table,
+                      const strata::paged::TreeShape& shape) {
+  std::string text = table + " height " + std::to_string(shape.height) +
+                     " nodes " + std::to_string(shape.node_count) + " keys " +
+                     std::to_string(shape.key_count) + " complete " +
+                     std::to_string(shape.is_complete) + ":";
+  for (const strata::paged::NodeSummary& node : shape.nodes) {
+    text += " " + std::to_string(node.page_id) + "/" +
+            std::to_string(node.key_count);
+  }
+  return text;
+}
+
+}  // namespace
+
+// The index of each of the 10000-row tables, built with a pool of 64 frames:
+// its shape, its check, 100 lookups, and the same after closing and opening
+// again.
+TEST(test_paged_environment_volume_data_indexes) {
+  const std::vector<ScaleTable>& tables = ScaleTables();
+  TempDir directory;
+  BuildIndexedDatabase(directory.path(), tables);
+  std::vector<std::string> first_shapes;
+  const ReplacementPolicyKind policies[] = {ReplacementPolicyKind::kLru,
+                                            ReplacementPolicyKind::kTwoQ};
+  for (ReplacementPolicyKind policy : policies) {
+    auto database = OpenDatabase(directory.path(), policy);
+    if (database == nullptr) {
+      return;
+    }
+    std::vector<std::string> shapes;
+    std::size_t heap_pages = 0;
+    std::size_t index_pages = 0;
+    for (const ScaleTable& table : tables) {
+      const std::string& name = table.schema.name;
+      CHECK_OK(database->CheckIndex(name));
+      auto heap = database->Table(name);
+      auto index = database->Index(name);
+      CHECK_OK(heap);
+      CHECK_OK(index);
+      if (!heap.ok() || !index.ok() || index.value() == nullptr) {
+        return;
+      }
+      auto shape = index.value()->Shape(40);
+      CHECK_OK(shape);
+      if (!shape.ok()) {
+        return;
+      }
+      // 10000 keys fill 35 to 70 leaves of 144 to 289 keys under one root.
+      CHECK_EQ(shape.value().height, std::size_t{2});
+      CHECK(shape.value().node_count - 1 >= 35);
+      CHECK(shape.value().node_count - 1 <= 70);
+      CHECK_EQ(shape.value().key_count, std::size_t{10000});
+      shapes.push_back(ShapeText(name, shape.value()));
+      heap_pages += heap.value()->FreeSpaceSnapshot().size();
+      index_pages += shape.value().node_count;
+      for (std::size_t position = 0; position < 100; ++position) {
+        const Row& row = table.rows[position * 100];
+        auto found = index.value()->Find(std::get<std::int64_t>(row[0]));
+        CHECK_OK(found);
+        if (!found.ok() || !found.value().has_value()) {
+          CHECK(found.ok() && found.value().has_value());
+          return;
+        }
+        auto fetched = heap.value()->Get(*found.value());
+        CHECK_OK(fetched);
+        if (fetched.ok()) {
+          CHECK(fetched.value() == row);
+        }
+      }
+    }
+    CHECK_OK(database->Close());
+    if (first_shapes.empty()) {
+      // Printed for the record; no size is asserted.
+      std::cout << "[size] heap pages " << heap_pages << ", index pages "
+                << index_pages << ", paged.db "
+                << std::filesystem::file_size(directory.path() / "paged.db")
+                << " bytes\n";
+      first_shapes = shapes;
+    } else {
+      CHECK(shapes == first_shapes);
     }
   }
 }
